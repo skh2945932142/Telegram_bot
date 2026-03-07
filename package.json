@@ -11,9 +11,8 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "dotenv": "^17.3.1",
+    "dotenv": "^16.6.1",
     "https-proxy-agent": "^7.0.6",
     "mongoose": "^9.2.4",
     "openai": "^6.27.0",

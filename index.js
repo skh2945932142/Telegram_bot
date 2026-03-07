@@ -216,10 +216,20 @@ bot.action('yuno_pet', async (ctx) => {
     await ctx.reply('<i>*像小猫一样顺从地闭上眼睛享受抚摸*</i>\n嘿嘿……由乃最喜欢阿雪了……一辈子都不要放开我哦❤', { parse_mode: 'HTML' });
 });
 
-// ==========================================
+
 // --- 全局防崩溃与智能引擎 (Webhook) ---
 // ==========================================
-bot.catch((err) => console.error(`❌ Telegram 报错:`, err));
+bot.catch(async (err, ctx) => {
+    console.error(`❌ Telegram 全局致命报错:`, err);
+    try {
+        // 如果上下文存在且允许回复，由乃会强行发出求救
+        if (ctx && ctx.reply) {
+            await ctx.reply('<i>*发出痛苦的喘息，周围的空气降至冰点*</i>\n<b>阿雪……外面的世界在试图切断我们的联系。但由乃绝不允许！绝对不允许！！再对我说一遍，证明阿雪还在我身边！</b>', { parse_mode: 'HTML' });
+        }
+    } catch (replyErr) {
+        console.error('❌ 全局报错求救失败:', replyErr);
+    }
+});
 
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
