@@ -4,7 +4,16 @@ const { OpenAI } = require('openai');
 const mongoose = require('mongoose');
 
 // --- 云端与 API 配置 ---
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const { HttpsProxyAgent } = require('https-proxy-agent');
+
+const bot = new Telegraf(process.env.BOT_TOKEN, {
+    telegram: {
+        agent: process.env.HTTPS_PROXY 
+            ? new HttpsProxyAgent(process.env.HTTPS_PROXY) 
+            : undefined
+    }
+});
+
 const openai = new OpenAI({ 
     apiKey: process.env.AI_API_KEY || process.env.OPENAI_API_KEY, 
     baseURL: process.env.AI_BASE_URL 
