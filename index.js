@@ -129,3 +129,4 @@ bot.catch((err) => console.error(`❌ Telegram 报错:`, err));
 bot.launch().then(() => console.log('✅ 由乃已苏醒，病娇状态机就绪。'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+//kexi
