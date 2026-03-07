@@ -102,6 +102,40 @@ bot.command('memory', async (ctx) => {
 // ==========================================
 // --- 核心对话逻辑 (兜底拦截普通聊天) ---
 // ==========================================
+// --- 新增：专门处理 Mini App 回传的数据 ---
+bot.on('message', async (ctx) => {
+    // 检查消息中是否包含 web_app_data
+    if (ctx.message && ctx.message.web_app_data) {
+        try {
+            const rawData = ctx.message.web_app_data.data;
+            const parsedData = JSON.parse(rawData);
+            const chatId = ctx.chat.id.toString();
+
+            if (parsedData.action === "submit_form") {
+                // 找到该用户的日记本
+                let yunoDiary = await Diary.findOne({ chatId: chatId });
+                if (!yunoDiary) {
+                    yunoDiary = new Diary({ chatId: chatId });
+                }
+
+                // 将 Mini App 传来的文本存入 records Map
+                const timestamp = new Date().toLocaleString();
+                yunoDiary.records.set(`APP_SAVED_${Date.now()}`, parsedData.text);
+                
+                // 增加爱意值（因为阿雪主动分享了情报）
+                yunoDiary.affection = Math.min(100, yunoDiary.affection + 5);
+                
+                await yunoDiary.save();
+
+                await ctx.reply(`<i>*轻抚着屏幕，眼中满是欣喜*</i>\n<b>阿雪在 Mini App 里写下的秘密，由乃已经一字不差地锁进记忆库里了。</b>\n\n📝 收到情报：${parsedData.text}`, { parse_mode: 'HTML' });
+            }
+        } catch (error) {
+            console.error('❌ 解析 Mini App 数据失败:', error);
+            await ctx.reply('💔 诶？阿雪发过来的秘密好像碎掉了...由乃没能读出来。');
+        }
+        return; // 处理完数据后截断，不再进入下方的 bot.on('text')
+    }
+});
 bot.on('text', async (ctx) => {
     const userMessage = ctx.message.text;
     const chatId = ctx.chat.id.toString();
