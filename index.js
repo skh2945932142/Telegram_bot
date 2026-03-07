@@ -8,15 +8,8 @@ const fs = require('fs');
 const agent = new HttpsProxyAgent('http://127.0.0.1:7890');
 agent.keepAlive = false; // 核心修复：防止 Socket 假死
 
-const bot = new Telegraf(process.env.BOT_TOKEN, { 
-    telegram: { agent } 
-});
-
-const openai = new OpenAI({
-    apiKey: process.env.AI_API_KEY,
-    baseURL: process.env.AI_BASE_URL,
-    httpAgent: agent 
-});
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const openai = new OpenAI({ apiKey: process.env.AI_API_KEY, baseURL: process.env.AI_BASE_URL });
 
 // --- 记忆与状态系统初始化 ---
 const MEMORY_FILE = './yuno_diary.json'; 
