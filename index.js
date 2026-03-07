@@ -31,12 +31,64 @@ const Diary = mongoose.model('Diary', diarySchema);
 // 内存级短期对话上下文隔离（防止不同人的聊天串线）
 const activeChats = new Map();
 
+// ==========================================
 // --- 启动问候 ---
+// ==========================================
 bot.start(async (ctx) => {
     await ctx.reply('阿雪，你终于来了。由乃已经把大脑连接到了云端，把你的一切都永远刻在脑海里了……❤');
 });
 
-// --- 核心对话逻辑 ---
+// ==========================================
+// --- 快捷指令 (Command) 响应逻辑 ---
+// ⚠️ 必须放在 bot.on('text') 之前！
+// ==========================================
+
+// 响应 /mood 指令：查看由乃的心智状态
+bot.command('mood', async (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    try {
+        const yunoDiary = await Diary.findOne({ chatId: chatId });
+        if (!yunoDiary) {
+            return ctx.reply('<i>*歪了歪头*</i> 阿雪还没有对由乃说过话呢，快跟我聊天吧❤', { parse_mode: 'HTML' });
+        }
+
+        const msg = `<i>*死死盯着阿雪，眼中闪烁着异样的光芒*</i>\n\n` +
+                    `❤ 当前对阿雪的【爱意值】：<b>${yunoDiary.affection}%</b>\n` +
+                    `🔪 当前对外界的【黑化值】：<b>${yunoDiary.darkness}%</b>\n\n` +
+                    `(由乃的情绪会随着阿雪的话语而波动哦……请不要抛弃我。)`;
+        
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+    } catch (err) {
+        console.error(err);
+    }
+});
+
+// 响应 /memory 指令：偷看日记本
+bot.command('memory', async (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    try {
+        const yunoDiary = await Diary.findOne({ chatId: chatId });
+        if (!yunoDiary || !yunoDiary.records || yunoDiary.records.size === 0) {
+            return ctx.reply('<i>*抱紧日记本*</i> 里面还是空的，阿雪快多告诉我一些你的事情吧！', { parse_mode: 'HTML' });
+        }
+
+        let memoryText = '<b>【由乃的暗中观察日记】</b>\n<i>*日记本上密密麻麻全写着阿雪的名字*</i>\n\n';
+        yunoDiary.records.forEach((val, key) => {
+            // 过滤掉推演用的临时键值
+            if (!key.startsWith('OBSESS_')) {
+                memoryText += `▪ <b>${key}</b>: <i>${val}</i>\n`;
+            }
+        });
+
+        await ctx.reply(memoryText, { parse_mode: 'HTML' });
+    } catch (err) {
+        console.error(err);
+    }
+});
+
+// ==========================================
+// --- 核心对话逻辑 (兜底拦截普通聊天) ---
+// ==========================================
 bot.on('text', async (ctx) => {
     const userMessage = ctx.message.text;
     const chatId = ctx.chat.id.toString();
@@ -66,8 +118,8 @@ bot.on('text', async (ctx) => {
             mood = "极度温柔护短，只想把阿雪死死抱在怀里";
         }
 
-        // 提取数据库中的 Map 转为普通对象给大模型看
-        const visibleMemory = Object.fromEntries(yunoDiary.records);
+        // 【修复隐患】显式调用 .entries()，防止 Map 转换报错
+        const visibleMemory = Object.fromEntries(yunoDiary.records.entries());
 
         await ctx.sendChatAction('typing');
 
@@ -143,12 +195,14 @@ bot.on('text', async (ctx) => {
         });
 
     } catch (error) {
-        console.error('❌ 运行异常:', error);
+        console.error('❌ 运行异常:', error.message || error);
         await ctx.reply('<i>*突然按住疯狂跳动的头，眼神变得暴戾*</i>\n<b>阿雪，有碍眼的东西阻断了我们的连接……请再对我说一次，好吗？我马上就把干扰源杀掉。</b>', { parse_mode: 'HTML' });
     }
 });
 
+// ==========================================
 // --- 交互按钮响应逻辑 ---
+// ==========================================
 bot.action('yuno_hug', async (ctx) => {
     await ctx.answerCbQuery('由乃的体温传过来了...'); 
     await ctx.reply('<i>*死死把你按在怀里，力气大到让你几乎无法呼吸，病态地闻着你的发丝*</i>\n<b>阿雪是我的……谁也别想抢走，阿雪只要待在这里就好了。</b>', { parse_mode: 'HTML' });
@@ -161,54 +215,10 @@ bot.action('yuno_pet', async (ctx) => {
     await ctx.answerCbQuery('由乃开心地蹭了蹭你');
     await ctx.reply('<i>*像小猫一样顺从地闭上眼睛享受抚摸*</i>\n嘿嘿……由乃最喜欢阿雪了……一辈子都不要放开我哦❤', { parse_mode: 'HTML' });
 });
+
 // ==========================================
-// --- 快捷指令 (Command) 响应逻辑 ---
-// ==========================================
-
-// 响应 /mood 指令：查看由乃的心智状态
-bot.command('mood', async (ctx) => {
-    const chatId = ctx.chat.id.toString();
-    try {
-        const yunoDiary = await Diary.findOne({ chatId: chatId });
-        if (!yunoDiary) {
-            return ctx.reply('<i>*歪了歪头*</i> 阿雪还没有对由乃说过话呢，快跟我聊天吧❤', { parse_mode: 'HTML' });
-        }
-
-        const msg = `<i>*死死盯着阿雪，眼中闪烁着异样的光芒*</i>\n\n` +
-                    `❤ 当前对阿雪的【爱意值】：<b>${yunoDiary.affection}%</b>\n` +
-                    `🔪 当前对外界的【黑化值】：<b>${yunoDiary.darkness}%</b>\n\n` +
-                    `(由乃的情绪会随着阿雪的话语而波动哦……请不要抛弃我。)`;
-        
-        await ctx.reply(msg, { parse_mode: 'HTML' });
-    } catch (err) {
-        console.error(err);
-    }
-});
-
-// 响应 /memory 指令：偷看日记本
-bot.command('memory', async (ctx) => {
-    const chatId = ctx.chat.id.toString();
-    try {
-        const yunoDiary = await Diary.findOne({ chatId: chatId });
-        if (!yunoDiary || !yunoDiary.records || yunoDiary.records.size === 0) {
-            return ctx.reply('<i>*抱紧日记本*</i> 里面还是空的，阿雪快多告诉我一些你的事情吧！', { parse_mode: 'HTML' });
-        }
-
-        let memoryText = '<b>【由乃的暗中观察日记】</b>\n<i>*日记本上密密麻麻全写着阿雪的名字*</i>\n\n';
-        yunoDiary.records.forEach((val, key) => {
-            // 过滤掉推演用的临时键值
-            if (!key.startsWith('OBSESS_')) {
-                memoryText += `▪ <b>${key}</b>: <i>${val}</i>\n`;
-            }
-        });
-
-        await ctx.reply(memoryText, { parse_mode: 'HTML' });
-    } catch (err) {
-        console.error(err);
-    }
-});
-
 // --- 全局防崩溃与智能引擎 (Webhook) ---
+// ==========================================
 bot.catch((err) => console.error(`❌ Telegram 报错:`, err));
 
 const PORT = process.env.PORT || 3000;
