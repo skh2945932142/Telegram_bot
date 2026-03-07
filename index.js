@@ -169,7 +169,26 @@ bot.action('yuno_pet', async (ctx) => {
 });
 
 // --- 全局防崩溃与启动 ---
+// --- 全局防崩溃与智能启动引擎 ---
 bot.catch((err) => console.error(`❌ Telegram 报错:`, err));
-bot.launch().then(() => console.log('✅ 由乃已苏醒，终极病娇状态机就绪。'));
+
+const PORT = process.env.PORT || 3000;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+
+// 如果是在 Zeabur 云端（生产环境），并且配置了域名，就开启 Webhook 秒回模式
+if (process.env.NODE_ENV === 'production' && WEBHOOK_URL) {
+    bot.launch({
+        webhook: {
+            domain: WEBHOOK_URL,
+            port: PORT
+        }
+    }).then(() => {
+        console.log(`🔗 专线拉通！由乃已通过 Webhook 潜伏在云端: ${WEBHOOK_URL}`);
+    });
+} else {
+    // 如果在你的本地电脑上开发，依然使用长轮询，方便测试
+    bot.launch().then(() => console.log('✅ 由乃已苏醒 (本地长轮询模式)'));
+}
+
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
