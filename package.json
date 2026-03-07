@@ -15,6 +15,7 @@
   "dependencies": {
     "dotenv": "^17.3.1",
     "https-proxy-agent": "^7.0.6",
+    "mongoose": "^9.2.4",
     "openai": "^6.27.0",
     "telegraf": "^4.16.3",
     "undici": "^7.22.0"
