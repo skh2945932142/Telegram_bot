@@ -8,6 +8,10 @@ const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 8080;
 app.use(express.json());
+app.use((req, res, next) => {
+    console.log(`[HTTP 收到请求] ${req.method} ${req.url}`);
+    next();
+})
 
 const botOptions = {};
 
@@ -177,7 +181,11 @@ bot.on('text', async (ctx) => {
         let keyboard = [[{ text: '❤ 摸摸由乃的头', callback_data: 'yuno_pet' }]];
         await ctx.reply(finalText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
 
-    } catch (error) { console.error(error); }
+    }  catch (error) { 
+        console.error('❌ 处理消息时发生严重错误:', error); 
+        // 关键：加一句回复，让你知道是不是大模型 API 坏了
+        await ctx.reply('<i>*捂住脑袋*</i> 啊……由乃的头好痛，大脑连接好像出了点问题……（请主人检查后台运行日志看是不是API报错了）', { parse_mode: 'HTML' });
+    }
 });
 
 // ==========================================
@@ -193,13 +201,12 @@ bot.action('yuno_pet', async (ctx) => {
 // ==========================================
 const WEBHOOK_PATH = `/webhook/${process.env.BOT_TOKEN}`;
 
-app.post(WEBHOOK_PATH, (req, res) => {
-    bot.handleUpdate(req.body, res);
-});
+// ✅ 官方标准写法，自动处理 JSON 解析并返回 200 OK
+app.use(bot.webhookCallback(WEBHOOK_PATH));
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-app.listen(PORT, async () => {
+app.listen(PORT, '0.0.0.0', async () => {
     console.log(`🚀 服务器已启动，监听端口 ${PORT}`);
     if (process.env.WEBHOOK_URL) {
         const url = `${process.env.WEBHOOK_URL}${WEBHOOK_PATH}`;
