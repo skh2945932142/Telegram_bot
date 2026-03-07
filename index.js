@@ -11,9 +11,12 @@ agent.keepAlive = false; // 核心修复：防止 Socket 假死
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.AI_API_KEY, baseURL: process.env.AI_BASE_URL });
 
-// --- 记忆与状态系统初始化 ---
-const MEMORY_FILE = './yuno_diary.json'; 
-let chatHistory = []; 
+// --- 记忆与状态系统初始
+const MEMORY_FILE = process.env.NODE_ENV === 'production' 
+    ? '/app/data/yuno_diary.json' 
+    : './yuno_diary.json';
+let chatHistory = [];
+
 
 function loadLongTermMemory() {
     try {
