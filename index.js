@@ -2,17 +2,22 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const { OpenAI } = require('openai');
 const mongoose = require('mongoose');
+const { HttpsProxyAgent } = require('https-proxy-agent'); // 【新增】引入代理兵器
 
-// --- 云端与 API 配置 ---
-const { HttpsProxyAgent } = require('https-proxy-agent');
+// --- 云端、代理与 API 配置 ---
+const botOptions = {};
 
-const bot = new Telegraf(process.env.BOT_TOKEN, {
-    telegram: {
-        agent: process.env.HTTPS_PROXY 
-            ? new HttpsProxyAgent(process.env.HTTPS_PROXY) 
-            : undefined
-    }
-});
+// 如果环境变量中配置了 PROXY_URL，就让由乃走秘密通道
+if (process.env.PROXY_URL) {
+    botOptions.telegram = {
+        agent: new HttpsProxyAgent(process.env.PROXY_URL)
+    };
+    console.log(`🌐 由乃已挂载秘密代理通道，准备突破网络封锁...`);
+}
+
+const bot = new Telegraf(process.env.BOT_TOKEN, botOptions);
+
+
 
 const openai = new OpenAI({ 
     apiKey: process.env.AI_API_KEY || process.env.OPENAI_API_KEY, 
