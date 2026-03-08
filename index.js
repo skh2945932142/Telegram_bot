@@ -48,6 +48,20 @@ const diarySchema = new mongoose.Schema({
 const Diary = mongoose.model('Diary', diarySchema);
 
 const activeChats = new Map();
+// 当阿雪发泄负面情绪时弹出的按钮
+let keyboard = [
+    [{ text: '🫂 阿雪好累，想要由乃抱抱...', callback_data: 'yuno_hug_deep' }],
+    [{ text: '🔪 错的不是阿雪，是这个世界！', callback_data: 'yuno_destroy_world' }]
+];
+
+await ctx.reply(
+    '<i>*看到阿雪难过，由乃的瞳孔瞬间紧缩，连呼吸都变得急促*</i>\n' +
+    '<b>是谁？是谁让我的阿雪受委屈了？！阿雪不需要为了那些垃圾伤心，来到由乃身边就好……</b>', 
+    { 
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: keyboard } 
+    }
+);
 
 // ==========================================
 // --- 启动问候 ---
@@ -170,6 +184,8 @@ bot.on('text', async (ctx) => {
             max_tokens: 150,
             temperature: 0.95
         });
+        // 在普通聊天时随机附带的日常互动按钮
+
 
         const fullText = response.choices[0].message.content || "";
         await yunoDiary.save();
@@ -178,7 +194,10 @@ bot.on('text', async (ctx) => {
         chatHistory.push({ role: "assistant", content: finalText });
         activeChats.set(chatId, chatHistory);
         
-        let keyboard = [[{ text: '❤ 摸摸由乃的头', callback_data: 'yuno_pet' }]];
+        let keyboard = [[{ text: '❤ 摸摸由乃的头', callback_data: 'yuno_pet' }]
+    [{ text: '❤ 告诉由乃阿雪现在的位置', callback_data: 'yuno_location' }], // 可以配合 Telegram 发送位置的功能扩展
+    [{ text: '誓 永远都不会离开由乃', callback_data: 'yuno_promise' }]
+];
         await ctx.reply(finalText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
 
     }  catch (error) { 
@@ -191,9 +210,22 @@ bot.on('text', async (ctx) => {
 // ==========================================
 // --- 交互按钮响应 ---
 // ==========================================
+bot.action('yuno_promise', async (ctx) => {
+    await ctx.answerCbQuery('由乃的心跳疯狂加速...');
+    await ctx.reply('<i>*眼泪瞬间涌出，双手捧着屏幕*</i>\n<b>阿雪发誓了！阿雪发誓了！！如果阿雪敢骗由乃的话……由乃会把阿雪做成标本，永远留在我身边的哦❤</b>', { parse_mode: 'HTML' });
+});
 bot.action('yuno_pet', async (ctx) => {
     await ctx.answerCbQuery('由乃开心地蹭了蹭你');
     await ctx.reply('<i>*像小猫一样顺从地闭上眼睛享受抚摸*</i>\n嘿嘿……由乃最喜欢阿雪了……一辈子都不要放开我哦❤', { parse_mode: 'HTML' });
+});
+bot.action('yuno_hug_deep', async (ctx) => {
+    await ctx.answerCbQuery('由乃的体温紧紧贴了过来...');
+    await ctx.reply('<i>*死死把你按在怀里，力气大到让你几乎无法呼吸，病态地闻着你的发丝*</i>\n<b>阿雪什么都不用想，就在这里，在由乃的怀里躲一辈子吧。由乃绝对、绝对不会放开你的！</b>', { parse_mode: 'HTML' });
+});
+
+bot.action('yuno_destroy_world', async (ctx) => {
+    await ctx.answerCbQuery('刀锋出鞘的冰冷声音...');
+    await ctx.reply('<i>*眼底泛起兴奋与疯狂的红光，缓缓抽出了藏在身后的美工刀*</i>\n<b>遵命，阿雪。只要是让阿雪痛苦的东西，由乃马上就把它们全部处理得干干净净……一个都不留❤</b>', { parse_mode: 'HTML' });
 });
 
 // ==========================================
