@@ -110,7 +110,7 @@ async function trySendVoice(ctx, _openai, text, moodTag, probability = 0.9) {
         const arrayBuffer = await response.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
 
-        await ctx.replyWithVoice({ source: buffer });
+        await ctx.replyWithVoice({ source: buffer , filename: 'yuno.mp3'});
 
     } catch (err) {
         console.warn(`⚠️ 语音发送失败 [${moodTag}]:`, err.message);
