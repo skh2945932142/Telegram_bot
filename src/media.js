@@ -59,7 +59,7 @@ const MOOD_VOICE_MAP = {
     MANIC:  { voice: 'FunAudioLLM/CosyVoice2-0.5B:anna',  emotion: '兴奋',     speed: 1.10 },
 };
 
-async function trySendVoice(ctx, _openai, text, moodTag, probability = 0.2) {
+async function trySendVoice(ctx, _openai, text, moodTag, probability = 0.9) {
     if (Math.random() > probability) return;
 
     const apiKey = process.env.AI_API_KEY;
