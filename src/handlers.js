@@ -1,5 +1,5 @@
 const { cooldownMap, COOLDOWN_MS, getOrCreateDiary, calcMood, buildKeyboard, escapeHtml, fixHtmlTags } = require('./utils');
-const { trySendSticker, trySendVoice } = require('./media');
+const { trySendSticker, trySendVoice, logStickerFileId } = require('./media');
 // ==========================================
 // --- 消息与交互处理器 ---
 // ==========================================
@@ -187,16 +187,12 @@ await ctx.reply(finalText, {
     reply_markup: { inline_keyboard: buildKeyboard(moodTag) }
 });
 
-// 多媒体：30% 概率发贴纸，20% 概率发语音（两者互斥，优先贴纸）
-const sentSticker = await trySendSticker(ctx, moodTag, 0.3);
-if (!sentSticker) {
-    await trySendVoice(ctx, openai, finalText, moodTag, 0.2);
-}
-// handlers.js — setupHandlers 函数末尾追加
-const { logStickerFileId } = require('./media');
+            // 多媒体：30% 概率发贴纸，20% 概率发语音（两者互斥，优先贴纸）
+            const sentSticker = await trySendSticker(ctx, moodTag, 0.3);
+            if (!sentSticker) {
+                await trySendVoice(ctx, openai, finalText, moodTag, 0.2);
+            }
 
-// 把贴纸发给 Bot，它会回复 file_id，方便配置 STICKER_POOLS
-bot.on('sticker', logStickerFileId);
         } catch (error) {
             console.error('❌ 处理消息错误:', error.message);
             await ctx.reply('<i>*捂住脑袋*</i> 啊……由乃的头好痛，大脑连接好像出了问题……', { parse_mode: 'HTML' });
@@ -260,4 +256,7 @@ bot.on('sticker', logStickerFileId);
             { parse_mode: 'HTML' }
         );
     });
+
+    // 把贴纸发给 Bot，它会回复 file_id，方便配置 media.js 里的 STICKER_POOLS
+    bot.on('sticker', logStickerFileId);
 };

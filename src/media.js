@@ -5,134 +5,128 @@
 // ──────────────────────────────────────────
 // 【贴纸配置】
 // 如何获取 file_id：
-//   1. 在 Telegram 里把想要的贴纸发给你的 Bot
-//   2. Bot 收到后，ctx.message.sticker.file_id 就是它
-//   3. 把 file_id 填到下面对应情绪的数组里
-//
-// 每种情绪可以配多个贴纸，会随机选一张发送。
+//   1. 把 bot.on('sticker', logStickerFileId) 注册进 handlers.js
+//   2. 把贴纸发给 Bot，它会回复对应的 file_id
+//   3. 复制到下方对应情绪的数组里
 // ──────────────────────────────────────────
 const STICKER_POOLS = {
-    LOVE:   [
-        // '填入 file_id_1',
-        // '填入 file_id_2',
-    ],
-    DARK:   [
-        // '填入 file_id_1',
-    ],
-    MANIC:  [
-        // '填入 file_id_1',
-    ],
-    WARN:   [
-        // '填入 file_id_1',
-    ],
-    TENDER: [
-        // '填入 file_id_1',
-    ],
-    JELLY:  [
-        // '填入 file_id_1',
-    ],
-    SAD:    [
-        // '填入 file_id_1',
-    ],
-    NORMAL: [
-        // '填入 file_id_1',
-    ],
+    LOVE:   [],
+    DARK:   [],
+    MANIC:  [],
+    WARN:   [],
+    TENDER: [],
+    JELLY:  [],
+    SAD:    [],
+    NORMAL: [],
 };
 
-// ──────────────────────────────────────────
-// 发送情绪对应的贴纸（概率触发）
-//   moodTag   : 当前情绪标签（来自 calcMood）
-//   probability: 0~1，发送概率，默认 0.3（30%）
-// ──────────────────────────────────────────
 async function trySendSticker(ctx, moodTag, probability = 0.3) {
-    if (Math.random() > probability) return false;// 不触发贴纸发送
-
+    if (Math.random() > probability) return false;
     const pool = STICKER_POOLS[moodTag] || [];
-    if (pool.length === 0) return false; // 该情绪还没有配置贴纸，跳过
-
+    if (pool.length === 0) return false;
     const fileId = pool[Math.floor(Math.random() * pool.length)];
     try {
         await ctx.replyWithSticker(fileId);
         return true;
     } catch (err) {
-        // 贴纸发送失败不应影响主流程，静默处理
         console.warn(`⚠️ 贴纸发送失败 [${moodTag}]:`, err.message);
-        return false;// 失败时返回 false，允许后续尝试发送语音
+        return false;
     }
 }
 
 // ──────────────────────────────────────────
-// 将文本转为语音并发送（OpenAI TTS）
+// 【硅基流动 TTS 语音配置】
 //
-// 使用方式：在 handlers.js 中对特定消息调用
-//   await trySendVoice(ctx, openai, text, moodTag)
+// 使用你已有的 AI_API_KEY，无需额外注册
+// 模型：FunAudioLLM/CosyVoice2-0.5B
 //
-// 情绪 → 音色映射（OpenAI TTS 支持的 voice）：
-//   nova   — 清甜明亮，适合 LOVE / TENDER
-//   shimmer — 温柔略带磁性，适合 NORMAL / SAD
-//   alloy  — 中性平静，适合 DARK / WARN
-//   echo   — 低沉有力，适合 MANIC
+// 情绪 → 音色 + 情感映射
+// 可用音色（预置）：
+//   anna, bella, claire, diana —— 女声
+//   alex, bob —— 男声
+//
+// 情感指令通过文本前缀注入，格式：
+//   "你能用[情感]的语气说吗？<|endofprompt|>正文"
 // ──────────────────────────────────────────
 const MOOD_VOICE_MAP = {
-    LOVE:   'nova',
-    TENDER: 'nova',
-    SAD:    'shimmer',
-    NORMAL: 'shimmer',
-    JELLY:  'shimmer',
-    DARK:   'alloy',
-    WARN:   'alloy',
-    MANIC:  'echo',
+    LOVE:   { voice: 'FunAudioLLM/CosyVoice2-0.5B:anna',  emotion: '温柔甜蜜', speed: 0.95 },
+    TENDER: { voice: 'FunAudioLLM/CosyVoice2-0.5B:anna',  emotion: '轻柔温和', speed: 0.90 },
+    NORMAL: { voice: 'FunAudioLLM/CosyVoice2-0.5B:anna',  emotion: '平静',     speed: 1.00 },
+    JELLY:  { voice: 'FunAudioLLM/CosyVoice2-0.5B:anna',  emotion: '委屈',     speed: 1.00 },
+    SAD:    { voice: 'FunAudioLLM/CosyVoice2-0.5B:anna',  emotion: '悲伤',     speed: 0.85 },
+    DARK:   { voice: 'FunAudioLLM/CosyVoice2-0.5B:diana', emotion: '冷漠',     speed: 0.85 },
+    WARN:   { voice: 'FunAudioLLM/CosyVoice2-0.5B:diana', emotion: '冷漠',     speed: 0.90 },
+    MANIC:  { voice: 'FunAudioLLM/CosyVoice2-0.5B:anna',  emotion: '兴奋',     speed: 1.10 },
 };
 
-async function trySendVoice(ctx, openai, text, moodTag, probability = 0.2) {
+async function trySendVoice(ctx, _openai, text, moodTag, probability = 0.2) {
     if (Math.random() > probability) return;
 
-    // 去掉 HTML 标签再送 TTS，否则由乃会念出 "<b>阿雪</b>"
+    const apiKey = process.env.AI_API_KEY;
+    if (!apiKey) {
+        console.warn('⚠️ 未找到 AI_API_KEY，语音功能跳过');
+        return;
+    }
+
+    // 去掉 HTML 标签和动作描述 *...*
     const cleanText = text
-        .replace(/<[^>]+>/g, '')   // 移除所有 HTML 标签
-        .replace(/\*.*?\*/g, '')   // 移除动作描述（*动作*）
+        .replace(/<[^>]+>/g, '')
+        .replace(/\*[^*]*\*/g, '')
         .replace(/\s+/g, ' ')
         .trim();
 
     if (!cleanText || cleanText.length < 5) return;
 
-    const voice = MOOD_VOICE_MAP[moodTag] || 'nova';
+    const setting = MOOD_VOICE_MAP[moodTag] || MOOD_VOICE_MAP.NORMAL;
+
+    // 通过前缀指令控制情感
+    const inputText = `你能用${setting.emotion}的语气说吗？<|endofprompt|>${cleanText}`;
 
     try {
         await ctx.sendChatAction('record_voice');
 
-        const ttsResponse = await openai.audio.speech.create({
-            model: 'tts-1',          // 速度快；高质量用 'tts-1-hd'
-            voice,
-            input: cleanText,
-            response_format: 'ogg', // Telegram voice 消息需要 ogg/opus
-            speed: 0.95,             // 略慢，更有气氛
+        const response = await fetch('https://api.siliconflow.cn/v1/audio/speech', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: 'FunAudioLLM/CosyVoice2-0.5B',
+                input: inputText,
+                voice: setting.voice,
+                speed: setting.speed,
+                response_format: 'mp3',
+            }),
         });
 
-        // 将流转为 Buffer
-        const arrayBuffer = await ttsResponse.arrayBuffer();
+        if (!response.ok) {
+            const errText = await response.text();
+            console.warn(`⚠️ 硅基流动 TTS 失败 [${response.status}]:`, errText);
+            return;
+        }
+
+        // 硅基流动直接返回音频二进制流
+        const arrayBuffer = await response.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
 
         await ctx.replyWithVoice({ source: buffer });
 
     } catch (err) {
         console.warn(`⚠️ 语音发送失败 [${moodTag}]:`, err.message);
-        // TTS 失败不影响主流程，静默跳过
     }
 }
 
 // ──────────────────────────────────────────
-// 辅助：记录收到的贴纸 file_id（调试用）
-// 在 index.js 或 handlers.js 注册：
-//   bot.on('sticker', logStickerFileId)
-// 然后把你喜欢的贴纸发给 Bot，控制台会打印 file_id
+// 辅助：打印收到的贴纸 file_id
+// 在 handlers.js 末尾注册：
+//   bot.on('sticker', logStickerFileId);
 // ──────────────────────────────────────────
 async function logStickerFileId(ctx) {
     const s = ctx.message.sticker;
-    console.log(`🏷️ 收到贴纸 file_id: ${s.file_id}`);
-    console.log(`   emoji: ${s.emoji || '(无)'}  set: ${s.set_name || '(无)'}`);
+    console.log(`🏷️ file_id: ${s.file_id}  emoji: ${s.emoji || '-'}  set: ${s.set_name || '-'}`);
     await ctx.reply(
-        `<code>${s.file_id}</code>\n复制这个 file_id 到 media.js 对应情绪的数组里即可 👆`,
+        `复制这个 file_id 到 media.js 对应情绪数组里：\n<code>${s.file_id}</code>`,
         { parse_mode: 'HTML' }
     );
 }
