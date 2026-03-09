@@ -66,4 +66,34 @@ function buildKeyboard(moodTag) {
     return boards[moodTag] || boards.NORMAL;
 }
 
-module.exports = { Diary, cooldownMap, COOLDOWN_MS, getOrCreateDiary, calcMood, buildKeyboard };
+// ==========================================
+// --- HTML 安全工具 ---
+// ==========================================
+
+// 转义用户可控内容中的 HTML 特殊字符，防止注入
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+// 自动补全 AI 回复中未闭合的 HTML 标签（Telegram 支持的标签子集）
+function fixHtmlTags(text) {
+    const stack = [];
+    const tagRe = /<(\/?)(b|i|u|s|code)\b[^>]*>/gi;
+    let m;
+    while ((m = tagRe.exec(text)) !== null) {
+        const isClosing = m[1] === '/';
+        const tag = m[2].toLowerCase();
+        if (!isClosing) {
+            stack.push(tag);
+        } else if (stack.length && stack[stack.length - 1] === tag) {
+            stack.pop();
+        }
+    }
+    return text + stack.reverse().map(t => `</${t}>`).join('');
+}
+
+module.exports = { Diary, cooldownMap, COOLDOWN_MS, getOrCreateDiary, calcMood, buildKeyboard, escapeHtml, fixHtmlTags };

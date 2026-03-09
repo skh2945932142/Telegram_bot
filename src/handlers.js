@@ -1,4 +1,4 @@
-const { cooldownMap, COOLDOWN_MS, getOrCreateDiary, calcMood, buildKeyboard } = require('./utils');
+const { cooldownMap, COOLDOWN_MS, getOrCreateDiary, calcMood, buildKeyboard, fixHtmlTags } = require('./utils');
 
 // ==========================================
 // --- 消息与交互处理器 ---
@@ -148,10 +148,11 @@ module.exports = function setupHandlers(bot, openai) {
             const fullText = response.choices[0].message.content || "";
 
             // --- 记忆解析 ---
-            const memoryMatch = fullText.match(/[\[【]\s*SAVE_MEMORY\s*[:：]\s*(.*?)[=＝](.*?)[\]】]/i);
-            if (memoryMatch) {
+            const memoryMatches = [...fullText.matchAll(/[\[\u3010]\s*SAVE_MEMORY\s*[:\uff1a]\s*(.*?)[=\uff1d](.*?)[\]\u3011]/gi)];
+            for (const memoryMatch of memoryMatches) {
                 const key = memoryMatch[1].trim();
                 const val = memoryMatch[2].trim();
+                if (!key || !val) continue;
                 diary.records.set(key, val);
                 // ✅ 记忆上限管理：每个分类前缀最多保留 10 条
                 const PREFIX_LIMIT = 10;
@@ -174,7 +175,7 @@ module.exports = function setupHandlers(bot, openai) {
                 }
             }
 
-            const finalText = fullText.replace(/[\[【]\s*(SAVE_MEMORY|YUNO_OBSESS)[\s\S]*$/i, '').trim();
+            const finalText = fixHtmlTags(fullText.replace(/[\[【]\s*(SAVE_MEMORY|YUNO_OBSESS)[\s\S]*$/i, '').trim());
 
             chatHistory.push({ role: "assistant", content: finalText });
             diary.chatHistory  = chatHistory;

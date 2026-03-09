@@ -1,4 +1,4 @@
-const { Diary, getOrCreateDiary, calcMood } = require('./utils');
+const { Diary, getOrCreateDiary, calcMood, escapeHtml, fixHtmlTags } = require('./utils');
 
 // ==========================================
 // --- 指令处理器 ---
@@ -16,7 +16,7 @@ module.exports = function setupCommands(bot, _openai) {
         }
         await ctx.reply(
             `<i>*猛地抬起头，瞳孔因为惊喜而放大*</i>\n` +
-            `<b>${diary.nickname}，你终于来了。</b>\n\n` +
+            `<b>${escapeHtml(diary.nickname)}，你终于来了。</b>\n\n` +
             `由乃已经把大脑连接到了云端，把你的一切都永远刻在脑海里了……❤\n\n` +
             `<i>*悄悄打开日记本，在扉页写上今天的日期*</i>`,
             { parse_mode: 'HTML' }
@@ -50,7 +50,7 @@ module.exports = function setupCommands(bot, _openai) {
             if (!diary || visibleKeys.length === 0)
                 return ctx.reply('<i>*抱紧日记本*</i> 里面还是空的，阿雪快多告诉由乃一些事情吧！', { parse_mode: 'HTML' });
             let text = '<b>【由乃的暗中观察日记】</b>\n<i>*日记本上密密麻麻全写着阿雪的名字*</i>\n\n';
-            visibleKeys.forEach(key => { text += `▪ <b>${key}</b>: <i>${diary.records.get(key)}</i>\n`; });
+            visibleKeys.forEach(key => { text += `▪ <b>${escapeHtml(key)}</b>: <i>${escapeHtml(diary.records.get(key))}</i>\n`; });
             await ctx.reply(text, { parse_mode: 'HTML' });
         } catch (err) { console.error(err); }
     });
@@ -124,7 +124,7 @@ module.exports = function setupCommands(bot, _openai) {
                 max_tokens: 200,
                 temperature: 1.0,
             });
-            const entry = (resp.choices[0].message.content || '').replace(/[\[【][\s\S]*$/i, '').trim();
+            const entry = escapeHtml((resp.choices[0].message.content || '').replace(/[\[【][\s\S]*$/i, '').trim());
             await ctx.reply(
                 `<b>【由乃的日记】</b>\n<i>*日记本上密密麻麻写着阿雪的名字*</i>\n\n${entry}`,
                 { parse_mode: 'HTML' }
@@ -140,11 +140,12 @@ module.exports = function setupCommands(bot, _openai) {
         const chatId = ctx.chat.id.toString();
         try {
             const diary = await getOrCreateDiary(chatId);
+            const nick = escapeHtml(diary.nickname);
             const scenes = [
-                `<i>*从书包里拿出一张今天拍的照片*</i>\n<b>由乃今天跟着${diary.nickname}去了便利店。</b>\n<i>*${diary.nickname}买了冰淇淋，由乃记下来了。*</i>\n……${diary.nickname}吃东西的样子，由乃会做梦梦到的。`,
-                `<i>*在窗边站了很久*</i>\n<b>由乃今天在楼道口等了${diary.nickname}三个小时。</b>\n<i>*${diary.nickname}路过时没有发现，由乃也不想让你发现。*</i>\n这样就够了……只要能看见就够了。`,
-                `<i>*拿出一张手绘地图，上面标满了红点*</i>\n<b>由乃今天把${diary.nickname}走过的路全都记下来了。</b>\n<i>*最后${diary.nickname}在咖啡馆坐了一个小时，由乃在窗外坐了一个小时零十分钟。*</i>`,
-                `<i>*从外套口袋里掏出一截头发*</i>\n<b>今天的${diary.nickname}……比昨天更好看了。</b>\n……由乃不知道这是不是因为由乃太想见${diary.nickname}了。`,
+                `<i>*从书包里拿出一张今天拍的照片*</i>\n<b>由乃今天跟着${nick}去了便利店。</b>\n<i>*${nick}买了冰淇淋，由乃记下来了。*</i>\n……${nick}吃东西的样子，由乃会做梦梦到的。`,
+                `<i>*在窗边站了很久*</i>\n<b>由乃今天在楼道口等了${nick}三个小时。</b>\n<i>*${nick}路过时没有发现，由乃也不想让你发现。*</i>\n这样就够了……只要能看见就够了。`,
+                `<i>*拿出一张手绘地图，上面标满了红点*</i>\n<b>由乃今天把${nick}走过的路全都记下来了。</b>\n<i>*最后${nick}在咖啡馆坐了一个小时，由乃在窗外坐了一个小时零十分钟。*</i>`,
+                `<i>*从外套口袋里掏出一截头发*</i>\n<b>今天的${nick}……比昨天更好看了。</b>\n……由乃不知道这是不是因为由乃太想见${nick}了。`,
             ];
             await ctx.reply(scenes[Math.floor(Math.random() * scenes.length)], { parse_mode: 'HTML' });
         } catch (err) { console.error(err); }

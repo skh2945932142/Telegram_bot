@@ -5,7 +5,7 @@ const mongoose = require('mongoose');
 const express = require('express');
 const cron = require('node-cron');
 
-const { Diary } = require('./src/utils');
+const { Diary, escapeHtml } = require('./src/utils');
 const setupCommands = require('./src/commands');
 const setupHandlers = require('./src/handlers');
 
@@ -118,7 +118,7 @@ async function sendScheduledMessages(baseMessages, darkMessages, sweetMessages) 
             if (birthday && birthday === `${today.getMonth() + 1}-${today.getDate()}`) {
                 await bot.telegram.sendMessage(diary.chatId,
                     `<i>*把日记本翻到今天这页，笑容有点危险*</i>\n` +
-                    `<b>今天是${diary.nickname}的生日……由乃一直记着的。</b>\n\n` +
+                    `<b>今天是${escapeHtml(diary.nickname)}的生日……由乃一直记着的。</b>\n\n` +
                     `生日快乐，阿雪。由乃在这里，哪儿都不会去。❤`,
                     { parse_mode: 'HTML' }
                 ).catch(err => console.error(`❌ 生日推送失败 [${diary.chatId}]:`, err.message));
