@@ -79,21 +79,63 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;');
 }
 
-// 自动补全 AI 回复中未闭合的 HTML 标签（Telegram 支持的标签子集）
+// 修复 AI 回复中的 HTML 标签嵌套问题（Telegram 支持的标签子集）
+// 同时处理：未闭合标签、交叉嵌套（如 <i><b>…</i></b>）
 function fixHtmlTags(text) {
+    const ALLOWED = new Set(['b', 'i', 'u', 's', 'code']);
     const stack = [];
-    const tagRe = /<(\/?)(b|i|u|s|code)\b[^>]*>/gi;
-    let m;
-    while ((m = tagRe.exec(text)) !== null) {
-        const isClosing = m[1] === '/';
-        const tag = m[2].toLowerCase();
-        if (!isClosing) {
-            stack.push(tag);
-        } else if (stack.length && stack[stack.length - 1] === tag) {
-            stack.pop();
+    let result = '';
+    let i = 0;
+
+    while (i < text.length) {
+        if (text[i] !== '<') {
+            result += text[i++];
+            continue;
         }
+        const tagMatch = text.slice(i).match(/^<(\/?)((b|i|u|s|code))\b[^>]*>/i);
+        if (!tagMatch) {
+            result += text[i++];
+            continue;
+        }
+        const fullTag  = tagMatch[0];
+        const isClosing = tagMatch[1] === '/';
+        const tagName  = tagMatch[2].toLowerCase();
+
+        if (!isClosing) {
+            stack.push(tagName);
+            result += `<${tagName}>`;
+        } else {
+            const idx = stack.lastIndexOf(tagName);
+            if (idx === -1) {
+                // 根本没打开过，直接丢弃这个多余的闭合标签
+            } else if (idx === stack.length - 1) {
+                // 正常闭合
+                stack.pop();
+                result += `</${tagName}>`;
+            } else {
+                // 交叉嵌套：先关掉上面的标签，再关目标，再重新打开上面的
+                const tagsAbove = [];
+                while (stack.length > 0 && stack[stack.length - 1] !== tagName) {
+                    const t = stack.pop();
+                    result += `</${t}>`;
+                    tagsAbove.unshift(t);
+                }
+                stack.pop(); // 弹出 tagName
+                result += `</${tagName}>`;
+                for (const t of tagsAbove) {
+                    stack.push(t);
+                    result += `<${t}>`;
+                }
+            }
+        }
+        i += fullTag.length;
     }
-    return text + stack.reverse().map(t => `</${t}>`).join('');
+
+    // 关闭所有剩余未闭合的标签
+    while (stack.length > 0) {
+        result += `</${stack.pop()}>`;
+    }
+    return result;
 }
 
 module.exports = { Diary, cooldownMap, COOLDOWN_MS, getOrCreateDiary, calcMood, buildKeyboard, escapeHtml, fixHtmlTags };

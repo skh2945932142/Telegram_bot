@@ -1,4 +1,4 @@
-const { cooldownMap, COOLDOWN_MS, getOrCreateDiary, calcMood, buildKeyboard, fixHtmlTags } = require('./utils');
+const { cooldownMap, COOLDOWN_MS, getOrCreateDiary, calcMood, buildKeyboard, escapeHtml, fixHtmlTags } = require('./utils');
 
 // ==========================================
 // --- 消息与交互处理器 ---
@@ -16,7 +16,7 @@ module.exports = function setupHandlers(bot, openai) {
                 diary.affection = Math.min(100, diary.affection + 5);
                 await diary.save();
                 await ctx.reply(
-                    `<i>*轻抚着屏幕，眼中满是欣喜*</i>\n<b>阿雪写下的秘密，由乃已经一字不差地锁进记忆库了。</b>\n\n📝 ${parsedData.text}`,
+                    `<i>*轻抚着屏幕，眼中满是欣喜*</i>\n<b>阿雪写下的秘密，由乃已经一字不差地锁进记忆库了。</b>\n\n📝 ${escapeHtml(parsedData.text)}`,
                     { parse_mode: 'HTML' }
                 );
             }
