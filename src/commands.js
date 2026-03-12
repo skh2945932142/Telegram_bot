@@ -28,14 +28,14 @@ module.exports = function setupCommands(bot, _openai) {
         const chatId = ctx.chat.id.toString();
         try {
             const diary = await Diary.findOne({ chatId });
-            if (!diary) return ctx.reply('<i>*歪了歪头*</i> 阿雪还没有对由乃说过话呢❤', { parse_mode: 'HTML' });
+            if (!diary) return ctx.reply('<i>*歪了歪头*</i> 斯卡哈          还没有对由乃说过话呢❤', { parse_mode: 'HTML' });
             const visibleCount = [...diary.records.keys()].filter(k => !k.startsWith('OBSESS_')).length;
             await ctx.reply(
-                `<i>*死死盯着阿雪，眼中闪烁着异样的光芒*</i>\n\n` +
+                `<i>*死死盯着斯卡哈，眼中闪烁着异样的光芒*</i>\n\n` +
                 `❤ 【爱意值】：<b>${diary.affection}%</b>\n` +
                 `🔪 【黑化值】：<b>${diary.darkness}%</b>\n` +
                 `💬 【记忆条目】：<b>${visibleCount} 条</b>\n\n` +
-                `<i>(由乃的情绪会随着阿雪的话语而波动……请不要抛弃我。)</i>`,
+                `<i>(由乃的情绪会随着斯卡哈的话语而波动……请不要抛弃我。)</i>`,
                 { parse_mode: 'HTML' }
             );
         } catch (err) { console.error(err); }
@@ -48,8 +48,8 @@ module.exports = function setupCommands(bot, _openai) {
             const diary = await Diary.findOne({ chatId });
             const visibleKeys = diary ? [...diary.records.keys()].filter(k => !k.startsWith('OBSESS_')) : [];
             if (!diary || visibleKeys.length === 0)
-                return ctx.reply('<i>*抱紧日记本*</i> 里面还是空的，阿雪快多告诉由乃一些事情吧！', { parse_mode: 'HTML' });
-            let text = '<b>【由乃的暗中观察日记】</b>\n<i>*日记本上密密麻麻全写着阿雪的名字*</i>\n\n';
+                return ctx.reply('<i>*抱紧日记本*</i> 里面还是空的，斯卡哈快多告诉由乃一些事情吧！', { parse_mode: 'HTML' });
+            let text = '<b>【由乃的暗中观察日记】</b>\n<i>*日记本上密密麻麻全写着斯卡哈的名字*</i>\n\n';
             visibleKeys.forEach(key => { text += `▪ <b>${escapeHtml(key)}</b>: <i>${escapeHtml(diary.records.get(key))}</i>\n`; });
             await ctx.reply(text, { parse_mode: 'HTML' });
         } catch (err) { console.error(err); }
@@ -65,7 +65,7 @@ module.exports = function setupCommands(bot, _openai) {
             });
             await ctx.reply(
                 '<i>*愣了很久，眼神慢慢变得空洞*</i>\n' +
-                '<b>……阿雪想让由乃忘掉一切吗。</b>\n\n' +
+                '<b>……斯卡哈想让由乃忘掉一切吗。</b>\n\n' +
                 '<i>*把日记本的每一页都撕掉，然后重新翻开第一页*</i>\n好……由乃重新开始记。',
                 { parse_mode: 'HTML' }
             );
@@ -76,8 +76,8 @@ module.exports = function setupCommands(bot, _openai) {
     bot.command('hug', async (ctx) => {
         await ctx.reply(
             '<i>*立刻丢下手里的一切，冲过去死死抱住你*</i>\n' +
-            '<b>阿雪看着我！那些让人头疼的东西根本不重要！</b>\n\n' +
-            '就算阿雪在这个世界里一败涂地，由乃也爱死这样的阿雪了！只要待在这里❤',
+            '<b>斯卡哈看着我！那些让人头疼的东西根本不重要！</b>\n\n' +
+            '就算斯卡哈在这个世界里一败涂地，由乃也爱死这样的斯卡哈了！只要待在这里❤',
             { parse_mode: 'HTML' }
         );
     });
@@ -86,7 +86,7 @@ module.exports = function setupCommands(bot, _openai) {
     bot.command('target', async (ctx) => {
         await ctx.reply(
             '<i>*缓缓歪过头，瞳孔急剧缩小*</i>\n' +
-            '<b>是谁？是谁又让阿雪心烦了？</b>\n\n' +
+            '<b>是谁？是谁又让斯卡哈心烦了？</b>\n\n' +
             '告诉由乃他的名字……由乃会在今晚把他们全部【清理】掉。🔪',
             { parse_mode: 'HTML' }
         );
@@ -96,8 +96,8 @@ module.exports = function setupCommands(bot, _openai) {
     bot.command('promise', async (ctx) => {
         await ctx.reply(
             '<i>*双手捧起你的脸，强迫你直视她微微颤抖的眼睛*</i>\n' +
-            '<b>阿雪是属于由乃的……绝对不会去看别人……</b>\n\n' +
-            '如果阿雪敢背叛的话，由乃会把阿雪做成标本，锁在只有我能找到的地方哦❤',
+            '<b>斯卡哈是属于由乃的……绝对不会去看别人……</b>\n\n' +
+            '如果斯卡哈敢背叛的话，由乃会把斯卡哈做成标本，锁在只有我能找到的地方哦❤',
             { parse_mode: 'HTML' }
         );
     });
@@ -126,12 +126,12 @@ module.exports = function setupCommands(bot, _openai) {
             });
             const entry = escapeHtml((resp.choices[0].message.content || '').replace(/[\[【][\s\S]*$/i, '').trim());
             await ctx.reply(
-                `<b>【由乃的日记】</b>\n<i>*日记本上密密麻麻写着阿雪的名字*</i>\n\n${entry}`,
+                `<b>【由乃的日记】</b>\n<i>*日记本上密密麻麻写着斯卡哈的名字*</i>\n\n${entry}`,
                 { parse_mode: 'HTML' }
             );
         } catch (err) {
             console.error(err);
-            await ctx.reply('<i>*把日记本合上*</i> ……这页，由乃不给阿雪看。', { parse_mode: 'HTML' });
+            await ctx.reply('<i>*把日记本合上*</i> ……这页，由乃不给斯卡哈看。', { parse_mode: 'HTML' });
         }
     });
 

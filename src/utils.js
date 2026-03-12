@@ -13,7 +13,7 @@ const diarySchema = new mongoose.Schema({
     // ✅ 最后活跃时间，定时推送只发活跃用户
     lastActiveAt: { type: Date, default: Date.now },
     // ✅ 用户昵称，由乃专属叫法
-    nickname:     { type: String, default: '阿雪' }
+    nickname:     { type: String, default: '斯卡哈' }
 });
 const Diary = mongoose.model('Diary', diarySchema);
 
@@ -55,9 +55,9 @@ function calcMood(diary, userMessage) {
 function buildKeyboard(moodTag) {
     const boards = {
         DARK:   [[{ text: '🔪 由乃冷静下来',     callback_data: 'yuno_calm' },          { text: '😈 让由乃去做吧',     callback_data: 'yuno_destroy_world' }]],
-        MANIC:  [[{ text: '🫂 阿雪哪儿都不去',   callback_data: 'yuno_hug_deep' },       { text: '📓 由乃写下来',       callback_data: 'yuno_write_diary' }]],
-        WARN:   [[{ text: '🫂 阿雪只在乎由乃',   callback_data: 'yuno_reassure' },       { text: '🔪 错的不是阿雪',     callback_data: 'yuno_destroy_world' }]],
-        TENDER: [[{ text: '🌡 让由乃照顾阿雪',   callback_data: 'yuno_pet' },            { text: '👁 由乃一直看着你',   callback_data: 'yuno_stare' }]],
+        MANIC:  [[{ text: '🫂 斯卡哈哪儿都不去',   callback_data: 'yuno_hug_deep' },       { text: '📓 由乃写下来',       callback_data: 'yuno_write_diary' }]],
+        WARN:   [[{ text: '🫂 斯卡哈只在乎由乃',   callback_data: 'yuno_reassure' },       { text: '🔪 错的不是斯卡哈',     callback_data: 'yuno_destroy_world' }]],
+        TENDER: [[{ text: '🌡 让由乃照顾斯卡哈',   callback_data: 'yuno_pet' },            { text: '👁 由乃一直看着你',   callback_data: 'yuno_stare' }]],
         JELLY:  [[{ text: '😤 当然是由乃最好',   callback_data: 'yuno_reassure' },       { text: '😏 逗逗由乃',         callback_data: 'yuno_tease' }]],
         SAD:    [[{ text: '🫂 我永远喜欢由乃',   callback_data: 'yuno_hug_deep' },       { text: '😏 让由乃猜猜',       callback_data: 'yuno_tease' }]],
         LOVE:   [[{ text: '❤ 摸摸由乃的头',      callback_data: 'yuno_pet' },            { text: '💋 亲一下由乃',       callback_data: 'yuno_kiss' }]],

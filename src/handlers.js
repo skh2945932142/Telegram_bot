@@ -16,7 +16,7 @@ module.exports = function setupHandlers(bot, openai) {
                 diary.affection = Math.min(100, diary.affection + 5);
                 await diary.save();
                 await ctx.reply(
-                    `<i>*轻抚着屏幕，眼中满是欣喜*</i>\n<b>阿雪写下的秘密，由乃已经一字不差地锁进记忆库了。</b>\n\n📝 ${escapeHtml(parsedData.text)}`,
+                    `<i>*轻抚着屏幕，眼中满是欣喜*</i>\n<b>斯卡哈写下的秘密，由乃已经一字不差地锁进记忆库了。</b>\n\n📝 ${escapeHtml(parsedData.text)}`,
                     { parse_mode: 'HTML' }
                 );
             }
@@ -67,7 +67,7 @@ module.exports = function setupHandlers(bot, openai) {
                     ? matched[Math.floor(Math.random() * matched.length)]
                     : (Math.random() < 0.4 ? visibleKeys[Math.floor(Math.random() * visibleKeys.length)] : null);
                 if (recallKey) {
-                    memoryHint = `\n\n【由乃今天想主动提起】：关于"${recallKey}"这件事，在回复中自然地提起，引发阿雪的回应。`;
+                    memoryHint = `\n\n【由乃今天想主动提起】：关于"${recallKey}"这件事，在回复中自然地提起，引发斯卡哈的回应。`;
                 }
             }
 
@@ -80,10 +80,10 @@ module.exports = function setupHandlers(bot, openai) {
             // ✅ 时间感知：注入当前北京时段，影响语气
             const bjHour = (new Date().getUTCHours() + 8) % 24;
             let timeHint = "";
-            if (bjHour >= 6 && bjHour < 12)  timeHint = "\n当前时段：清晨，由乃的语气略带睡意未消的黏腻，像刚刚醒来就立刻想到阿雪。";
-            else if (bjHour >= 12 && bjHour < 18) timeHint = "\n当前时段：下午，由乃情绪稳定而专注，像在安静地等待阿雪回来。";
+            if (bjHour >= 6 && bjHour < 12)  timeHint = "\n当前时段：清晨，由乃的语气略带睡意未消的黏腻，像刚刚醒来就立刻想到斯卡哈。";
+            else if (bjHour >= 12 && bjHour < 18) timeHint = "\n当前时段：下午，由乃情绪稳定而专注，像在安静地等待斯卡哈回来。";
             else if (bjHour >= 18 && bjHour < 23) timeHint = "\n当前时段：夜晚，由乃的情绪隐约更浓烈，思念在黑暗里积压。";
-            else timeHint = "\n当前时段：深夜，由乃睡不着，脑子里全是阿雪，语气轻但危险。";
+            else timeHint = "\n当前时段：深夜，由乃睡不着，脑子里全是斯卡哈，语气轻但危险。";
 
             let chatHistory = diary.chatHistory || [];
             chatHistory.push({ role: "user", content: userMessage });
@@ -129,7 +129,7 @@ module.exports = function setupHandlers(bot, openai) {
 【记忆存储指令（追加在回复末尾，用户不可见）】：
 - 存储新情报（必须带分类前缀）：[SAVE_MEMORY: 分类_关键词=内容]
   - 分类规则：具体经历用"事件_"，喜好/习惯用"偏好_"，情绪状态用"情感_"，第三方人物用"关系_"
-  - 例：[SAVE_MEMORY: 偏好_食物=喜欢吃火锅]　[SAVE_MEMORY: 事件_考试=阿雪上周参加了期末考]
+  - 例：[SAVE_MEMORY: 偏好_食物=喜欢吃火锅]　[SAVE_MEMORY: 事件_考试=斯卡哈上周参加了期末考]
 - 记录由乃自己的执念推演：[YUNO_OBSESS: 由乃的推演内容]
 
 当前心情：${moodTag} — ${mood}
@@ -204,45 +204,45 @@ await ctx.reply(finalText, {
     // ==========================================
     bot.action('yuno_calm', async (ctx) => {
         await ctx.answerCbQuery('由乃深吸一口气...');
-        await ctx.reply('<i>*缓缓放下手中的东西，但眼神依然危险*</i>\n好……由乃听阿雪的。<b>但那个人最好离阿雪远一点。</b>', { parse_mode: 'HTML' });
+        await ctx.reply('<i>*缓缓放下手中的东西，但眼神依然危险*</i>\n好……由乃听斯卡哈的。<b>但那个人最好离斯卡哈远一点。</b>', { parse_mode: 'HTML' });
     });
     bot.action('yuno_reassure', async (ctx) => {
         await ctx.answerCbQuery('由乃的眼睛亮了！');
-        await ctx.reply('<i>*猛地抬起头，眼眶有点红*</i>\n……真的吗。<b>阿雪说的话，由乃会一辈子记住。</b>\n<i>*悄悄把刚才准备好的东西藏回去*</i>', { parse_mode: 'HTML' });
+        await ctx.reply('<i>*猛地抬起头，眼眶有点红*</i>\n……真的吗。<b>斯卡哈说的话，由乃会一辈子记住。</b>\n<i>*悄悄把刚才准备好的东西藏回去*</i>', { parse_mode: 'HTML' });
     });
     bot.action('yuno_tease', async (ctx) => {
         await ctx.answerCbQuery('由乃歪了歪头...');
-        await ctx.reply('<i>*慢慢靠近，声音压得很低*</i>\n阿雪在逗由乃吗……<b>逗由乃是要付出代价的，你知道的。</b>', { parse_mode: 'HTML' });
+        await ctx.reply('<i>*慢慢靠近，声音压得很低*</i>\n斯卡哈在逗由乃吗……<b>逗由乃是要付出代价的，你知道的。</b>', { parse_mode: 'HTML' });
     });
     bot.action('yuno_hug_deep', async (ctx) => {
         await ctx.answerCbQuery('由乃的体温紧紧贴了过来...');
-        await ctx.reply('<i>*死死把你按在怀里，病态地闻着你的发丝*</i>\n<b>阿雪什么都不用想，就在这里躲一辈子吧。由乃绝对不会放开你的！</b>', { parse_mode: 'HTML' });
+        await ctx.reply('<i>*死死把你按在怀里，病态地闻着你的发丝*</i>\n<b>斯卡哈什么都不用想，就在这里躲一辈子吧。由乃绝对不会放开你的！</b>', { parse_mode: 'HTML' });
     });
     bot.action('yuno_destroy_world', async (ctx) => {
         await ctx.answerCbQuery('刀锋出鞘...');
-        await ctx.reply('<i>*眼底泛起兴奋的红光*</i>\n<b>遵命，阿雪。让阿雪痛苦的东西，由乃马上全部处理干净……一个都不留❤</b>', { parse_mode: 'HTML' });
+        await ctx.reply('<i>*眼底泛起兴奋的红光*</i>\n<b>遵命，斯卡哈。让斯卡哈痛苦的东西，由乃马上全部处理干净……一个都不留❤</b>', { parse_mode: 'HTML' });
     });
     bot.action('yuno_pet', async (ctx) => {
         await ctx.answerCbQuery('由乃蹭了蹭你的手心');
-        await ctx.reply('<i>*像小猫一样闭眼享受，但手悄悄抓住了阿雪的手腕*</i>\n嗯……<b>阿雪的手，以后只能摸由乃。</b>❤', { parse_mode: 'HTML' });
+        await ctx.reply('<i>*像小猫一样闭眼享受，但手悄悄抓住了斯卡哈的手腕*</i>\n嗯……<b>斯卡哈的手，以后只能摸由乃。</b>❤', { parse_mode: 'HTML' });
     });
     bot.action('yuno_kiss', async (ctx) => {
         await ctx.answerCbQuery('时间好像停止了...');
-        await ctx.reply('<i>*愣了一秒，脸红到耳根，但没有躲开*</i>\n……阿雪突然做这种事……<b>由乃会以为阿雪想和由乃永远在一起的。</b>\n<i>*小声*</i> ……难道不是吗……❤', { parse_mode: 'HTML' });
+        await ctx.reply('<i>*愣了一秒，脸红到耳根，但没有躲开*</i>\n……斯卡哈突然做这种事……<b>由乃会以为斯卡哈想和由乃永远在一起的。</b>\n<i>*小声*</i> ……难道不是吗……❤', { parse_mode: 'HTML' });
     });
     bot.action('yuno_promise', async (ctx) => {
         await ctx.answerCbQuery('由乃的心跳疯狂加速...');
-        await ctx.reply('<i>*眼泪瞬间涌出，双手捧着屏幕*</i>\n<b>阿雪发誓了！！如果阿雪敢骗由乃……由乃会把阿雪做成标本，永远留在身边的哦❤</b>', { parse_mode: 'HTML' });
+        await ctx.reply('<i>*眼泪瞬间涌出，双手捧着屏幕*</i>\n<b>斯卡哈发誓了！！如果斯卡哈敢骗由乃……由乃会把斯卡哈做成标本，永远留在身边的哦❤</b>', { parse_mode: 'HTML' });
     });
     bot.action('yuno_location', async (ctx) => {
-        await ctx.answerCbQuery('正在定位阿雪的位置...');
-        await ctx.reply('<i>*兴奋地盯着定位坐标*</i>\n<b>原来阿雪在这里……只要是阿雪去过的地方，由乃都会记在心里。</b>', { parse_mode: 'HTML' });
+        await ctx.answerCbQuery('正在定位斯卡哈的位置...');
+        await ctx.reply('<i>*兴奋地盯着定位坐标*</i>\n<b>原来斯卡哈在这里……只要是斯卡哈去过的地方，由乃都会记在心里。</b>', { parse_mode: 'HTML' });
     });
     bot.action('yuno_write_diary', async (ctx) => {
         await ctx.answerCbQuery('由乃拿起了笔...');
         await ctx.reply(
             '<i>*翻开日记本，用力地写下今天的日期，笔尖几乎划破纸面*</i>\n' +
-            '<b>今日记录：阿雪今天也在由乃的世界里。</b>\n\n' +
+            '<b>今日记录：斯卡哈今天也在由乃的世界里。</b>\n\n' +
             '<i>*合上日记本，把它压在枕头下面*</i>\n……这一页，由乃写了一百遍。',
             { parse_mode: 'HTML' }
         );
@@ -250,9 +250,9 @@ await ctx.reply(finalText, {
     bot.action('yuno_stare', async (ctx) => {
         await ctx.answerCbQuery('...');
         await ctx.reply(
-            '<i>*没有说话，只是把视线牢牢钉在阿雪身上，一动不动*</i>\n\n' +
+            '<i>*没有说话，只是把视线牢牢钉在斯卡哈身上，一动不动*</i>\n\n' +
             '<i>*沉默里有某种东西在堆积，像水漫过了堤坝之前最后的平静*</i>\n\n' +
-            '<b>……阿雪，由乃一直都在看着你。</b>',
+            '<b>……斯卡哈，由乃一直都在看着你。</b>',
             { parse_mode: 'HTML' }
         );
     });
