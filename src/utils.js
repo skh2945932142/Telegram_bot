@@ -14,7 +14,7 @@ const diarySchema = new mongoose.Schema({
     lastActiveAt: { type: Date, default: Date.now },
     // ✅ 用户昵称，由乃专属叫法
     nickname:     { type: String, default: '斯卡哈' }
-});
+},{ versionKey: false });
 const Diary = mongoose.model('Diary', diarySchema);
 
 // ✅ 防刷屏冷却（内存级，无需持久化）

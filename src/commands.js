@@ -157,7 +157,7 @@ module.exports = function setupCommands(bot, _openai) {
         const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
         if (!args) {
             return ctx.reply(
-                '<i>*歪头*</i> 阿雪要告诉由乃生日吗……\n用法：<code>/birthday 月-日</code>，比如 <code>/birthday 3-15</code>',
+                '<i>*歪头*</i> 斯卡哈要告诉由乃生日吗……\n用法：<code>/birthday 月-日</code>，比如 <code>/birthday 3-15</code>',
                 { parse_mode: 'HTML' }
             );
         }
@@ -180,7 +180,7 @@ module.exports = function setupCommands(bot, _openai) {
         const chatId = ctx.chat.id.toString();
         try {
             const diary = await Diary.findOne({ chatId });
-            if (!diary) return ctx.reply('<i>*歪了歪头*</i> 阿雪还没有对由乃说过话呢❤', { parse_mode: 'HTML' });
+            if (!diary) return ctx.reply('<i>*歪了歪头*</i> 斯卡哈还没有对由乃说过话呢❤', { parse_mode: 'HTML' });
             const { tag: moodTag, desc: mood } = calcMood(diary, '');
             const moodEmoji = { DARK:'🔪', MANIC:'💢', WARN:'⚠️', TENDER:'🌡', LOVE:'❤', JELLY:'😤', SAD:'😢', NORMAL:'👁' };
             const visibleCount = [...diary.records.keys()].filter(k => !k.startsWith('OBSESS_')).length;
