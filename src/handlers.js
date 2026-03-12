@@ -14,7 +14,16 @@ module.exports = function setupHandlers(bot, openai) {
                 const diary = await getOrCreateDiary(chatId);
                 diary.records.set(`APP_SAVED_${Date.now()}`, parsedData.text);
                 diary.affection = Math.min(100, diary.affection + 5);
-                await diary.save();
+               await Diary.findOneAndUpdate(
+    { chatId },
+    {
+        affection:    diary.affection,
+        darkness:     diary.darkness,
+        records:      diary.records,
+        chatHistory:  chatHistory,
+        lastActiveAt: new Date(),
+    }
+);
                 await ctx.reply(
                     `<i>*轻抚着屏幕，眼中满是欣喜*</i>\n<b>斯卡哈写下的秘密，由乃已经一字不差地锁进记忆库了。</b>\n\n📝 ${escapeHtml(parsedData.text)}`,
                     { parse_mode: 'HTML' }
