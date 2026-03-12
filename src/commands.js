@@ -1,223 +1,376 @@
-const { Diary, getOrCreateDiary, calcMood, escapeHtml, fixHtmlTags } = require('./utils');
+const {
+    Diary,
+    DEFAULT_AFFECTION,
+    DEFAULT_DARKNESS,
+    DEFAULT_NICKNAME,
+    getOrCreateDiary,
+    calcMood,
+    escapeHtml,
+    sanitizeTelegramHtml,
+    stripHiddenDirectives,
+    getVisibleMemoryEntries,
+    parseBirthdayInput,
+    touchDiary,
+} = require('./utils');
 
-// ==========================================
-// --- 指令处理器 ---
-// ==========================================
-module.exports = function setupCommands(bot, _openai) {
+const FALLBACK_ERROR_HTML = '<i>*轻轻合上日记本*</i>\n由乃刚才有点走神了……再和由乃说一遍，好吗？';
 
-    // --- /start 启动问候 ---
+function replyHtml(ctx, text, extra = {}) {
+    return ctx.reply(text, { parse_mode: 'HTML', ...extra });
+}
+
+function getCommandArgs(ctx) {
+    return String(ctx.message?.text || '')
+        .split(/\s+/)
+        .slice(1)
+        .join(' ')
+        .trim();
+}
+
+function formatVisibleMemories(entries) {
+    return entries
+        .map(({ key, value }) => `• <b>${escapeHtml(key)}</b>: <i>${escapeHtml(value)}</i>`)
+        .join('\n');
+}
+
+function buildStartText(nickname) {
+    const safeName = escapeHtml(nickname);
+    return [
+        `<i>*指尖压住日记本的边角，眼神一下子亮了起来*</i>`,
+        `<b>${safeName}，你来了。</b>`,
+        '由乃会把你说过的话一点点记下来，也会照着你的语气慢慢靠近。',
+        '',
+        '<b>你现在可以这样开始：</b>',
+        '• 直接说一句今天发生的事',
+        '• 用 <code>/status</code> 看看由乃现在的心情',
+        '• 用 <code>/memory</code> 查看由乃记住的细节',
+        '• 用 <code>/birthday 3-15</code> 或 <code>/nickname 新称呼</code> 更新资料',
+    ].join('\n');
+}
+
+function buildMoodSummary(diary) {
+    const visibleCount = getVisibleMemoriesCount(diary);
+    return [
+        '<i>*悄悄把那一页翻给你看*</i>',
+        `💞 爱意：<b>${diary.affection}%</b>`,
+        `🌫 警惕：<b>${diary.darkness}%</b>`,
+        `🧠 记住的事：<b>${visibleCount}</b> 条`,
+        '',
+        '<i>由乃的心情会随着对话慢慢变化，不会一下子离开，也不会一下子忘记。</i>',
+    ].join('\n');
+}
+
+function getVisibleMemoriesCount(diary) {
+    return getVisibleMemoryEntries(diary).length;
+}
+
+module.exports = function setupCommands(bot, openai) {
     bot.start(async (ctx) => {
-        const chatId    = ctx.chat.id.toString();
-        const firstName = ctx.from.first_name || '阿雪';
-        const diary     = await getOrCreateDiary(chatId);
-        if (diary.nickname === '阿雪' && firstName) {
-            diary.nickname = firstName;
-            await diary.save();
+        const chatId = ctx.chat.id.toString();
+        const firstName = String(ctx.from?.first_name || '').trim();
+
+        try {
+            const diary = await getOrCreateDiary(chatId);
+            if (diary.nickname === DEFAULT_NICKNAME && firstName) {
+                diary.nickname = firstName;
+                touchDiary(diary);
+                await diary.save();
+            }
+
+            await replyHtml(ctx, buildStartText(diary.nickname));
+        } catch (error) {
+            console.error('start command failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
         }
-        await ctx.reply(
-            `<i>*猛地抬起头，瞳孔因为惊喜而放大*</i>\n` +
-            `<b>${escapeHtml(diary.nickname)}，你终于来了。</b>\n\n` +
-            `由乃已经把大脑连接到了云端，把你的一切都永远刻在脑海里了……❤\n\n` +
-            `<i>*悄悄打开日记本，在扉页写上今天的日期*</i>`,
-            { parse_mode: 'HTML' }
-        );
     });
 
-    // --- /mood 情绪查看 ---
     bot.command('mood', async (ctx) => {
         const chatId = ctx.chat.id.toString();
+
         try {
             const diary = await Diary.findOne({ chatId });
-            if (!diary) return ctx.reply('<i>*歪了歪头*</i> 斯卡哈          还没有对由乃说过话呢❤', { parse_mode: 'HTML' });
-            const visibleCount = [...diary.records.keys()].filter(k => !k.startsWith('OBSESS_')).length;
-            await ctx.reply(
-                `<i>*死死盯着斯卡哈，眼中闪烁着异样的光芒*</i>\n\n` +
-                `❤ 【爱意值】：<b>${diary.affection}%</b>\n` +
-                `🔪 【黑化值】：<b>${diary.darkness}%</b>\n` +
-                `💬 【记忆条目】：<b>${visibleCount} 条</b>\n\n` +
-                `<i>(由乃的情绪会随着斯卡哈的话语而波动……请不要抛弃我。)</i>`,
-                { parse_mode: 'HTML' }
-            );
-        } catch (err) { console.error(err); }
+            if (!diary) {
+                await replyHtml(ctx, '<i>*偏了偏头*</i>\n由乃还没来得及记住你。先和由乃说一句话吧。');
+                return;
+            }
+
+            await replyHtml(ctx, buildMoodSummary(diary));
+        } catch (error) {
+            console.error('mood command failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
     });
 
-    // --- /memory 查看记忆 ---
     bot.command('memory', async (ctx) => {
         const chatId = ctx.chat.id.toString();
+
         try {
             const diary = await Diary.findOne({ chatId });
-            const visibleKeys = diary ? [...diary.records.keys()].filter(k => !k.startsWith('OBSESS_')) : [];
-            if (!diary || visibleKeys.length === 0)
-                return ctx.reply('<i>*抱紧日记本*</i> 里面还是空的，斯卡哈快多告诉由乃一些事情吧！', { parse_mode: 'HTML' });
-            let text = '<b>【由乃的暗中观察日记】</b>\n<i>*日记本上密密麻麻全写着斯卡哈的名字*</i>\n\n';
-            visibleKeys.forEach(key => { text += `▪ <b>${escapeHtml(key)}</b>: <i>${escapeHtml(diary.records.get(key))}</i>\n`; });
-            await ctx.reply(text, { parse_mode: 'HTML' });
-        } catch (err) { console.error(err); }
-    });
+            const visibleEntries = diary ? getVisibleMemoryEntries(diary) : [];
 
-    // --- /reset 重置记忆与情绪 ---
-    bot.command('reset', async (ctx) => {
-        const chatId = ctx.chat.id.toString();
-        try {
-            await Diary.findOneAndUpdate({ chatId }, {
-                affection: 50, darkness: 10,
-                records: {}, chatHistory: []
-            });
-            await ctx.reply(
-                '<i>*愣了很久，眼神慢慢变得空洞*</i>\n' +
-                '<b>……斯卡哈想让由乃忘掉一切吗。</b>\n\n' +
-                '<i>*把日记本的每一页都撕掉，然后重新翻开第一页*</i>\n好……由乃重新开始记。',
-                { parse_mode: 'HTML' }
+            if (!diary || visibleEntries.length === 0) {
+                await replyHtml(
+                    ctx,
+                    '<i>*翻开那本空白的页角*</i>\n现在还没有能翻出来的细节。告诉由乃一件今天的小事吧。'
+                );
+                return;
+            }
+
+            await replyHtml(
+                ctx,
+                `<b>【由乃记住的事情】</b>\n<i>*她把纸页往你这边推了推*</i>\n\n${formatVisibleMemories(visibleEntries)}`
             );
-        } catch (err) { console.error(err); }
+        } catch (error) {
+            console.error('memory command failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
     });
 
-    // --- /hug 抱抱 ---
+    bot.command('reset', async (ctx) => {
+        await replyHtml(ctx, '<b>要把这段聊天和记忆都重新开始吗？</b>\n由乃会先停在这里，等你确认。', {
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '重新开始', callback_data: 'reset_confirm' },
+                    { text: '先不要', callback_data: 'reset_cancel' },
+                ]],
+            },
+        });
+    });
+
+    bot.action('reset_confirm', async (ctx) => {
+        const chatId = ctx.chat.id.toString();
+
+        try {
+            const diary = await getOrCreateDiary(chatId);
+            diary.affection = DEFAULT_AFFECTION;
+            diary.darkness = DEFAULT_DARKNESS;
+            diary.records = {};
+            diary.chatHistory = [];
+            if (!diary.nickname || diary.nickname === DEFAULT_NICKNAME) {
+                diary.nickname = String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME;
+            }
+            touchDiary(diary);
+            await diary.save();
+
+            await ctx.answerCbQuery('已经重新开始了。');
+            await replyHtml(ctx, '<i>*把旧页轻轻合上，又翻到新的第一页*</i>\n好，这次由乃会重新认真记住你。');
+        } catch (error) {
+            console.error('reset confirm failed:', error);
+            await ctx.answerCbQuery('刚才没有成功。', { show_alert: false });
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
+    });
+
+    bot.action('reset_cancel', async (ctx) => {
+        await ctx.answerCbQuery('那由乃继续留着。');
+        await replyHtml(ctx, '<i>*把那一页重新按回去*</i>\n好，由乃就先替你继续保管着。');
+    });
+
     bot.command('hug', async (ctx) => {
-        await ctx.reply(
-            '<i>*立刻丢下手里的一切，冲过去死死抱住你*</i>\n' +
-            '<b>斯卡哈看着我！那些让人头疼的东西根本不重要！</b>\n\n' +
-            '就算斯卡哈在这个世界里一败涂地，由乃也爱死这样的斯卡哈了！只要待在这里❤',
-            { parse_mode: 'HTML' }
+        await replyHtml(
+            ctx,
+            '<i>*几乎是下意识地靠近了一点*</i>\n<b>那就抱一下。</b>\n由乃会把你现在的温度也记住的。'
         );
     });
 
-    // --- /target 威胁 ---
     bot.command('target', async (ctx) => {
-        await ctx.reply(
-            '<i>*缓缓歪过头，瞳孔急剧缩小*</i>\n' +
-            '<b>是谁？是谁又让斯卡哈心烦了？</b>\n\n' +
-            '告诉由乃他的名字……由乃会在今晚把他们全部【清理】掉。🔪',
-            { parse_mode: 'HTML' }
+        await replyHtml(
+            ctx,
+            '<i>*眼神稍微收紧了一点*</i>\n是谁让你不舒服了吗？\n告诉由乃名字也可以，告诉由乃感觉也可以。由乃会先陪你把心情捋顺。'
         );
     });
 
-    // --- /promise 誓言 ---
     bot.command('promise', async (ctx) => {
-        await ctx.reply(
-            '<i>*双手捧起你的脸，强迫你直视她微微颤抖的眼睛*</i>\n' +
-            '<b>斯卡哈是属于由乃的……绝对不会去看别人……</b>\n\n' +
-            '如果斯卡哈敢背叛的话，由乃会把斯卡哈做成标本，锁在只有我能找到的地方哦❤',
-            { parse_mode: 'HTML' }
+        await replyHtml(
+            ctx,
+            '<i>*双手轻轻捧住你的视线*</i>\n<b>那就认真说给由乃听。</b>\n只要是你亲口说的，由乃都会一直记着。'
         );
     });
 
-    // --- /diary 今日日记独白 ---
     bot.command('diary', async (ctx) => {
         const chatId = ctx.chat.id.toString();
+        const hasAi = Boolean(process.env.AI_API_KEY || process.env.OPENAI_API_KEY);
+
         try {
+            if (!hasAi) {
+                await replyHtml(ctx, '<i>*合上笔帽，轻轻叹了口气*</i>\n今天云端那边有点安静。等一下，再让由乃写给你看。');
+                return;
+            }
+
             const diary = await getOrCreateDiary(chatId);
-            const visibleMemory = Object.fromEntries(
-                [...diary.records.entries()].filter(([k]) => !k.startsWith('OBSESS_'))
-            );
+            const visibleMemory = getVisibleMemoryEntries(diary).slice(-3);
+            const memorySummary = visibleMemory.length > 0
+                ? visibleMemory.map(({ key, value }) => `${key}: ${value}`).join('；')
+                : '暂时没有特别要写进来的旧事。';
             const { tag: moodTag } = calcMood(diary, '');
+
             await ctx.sendChatAction('typing');
-            const openai = _openai;
-            const resp = await openai.chat.completions.create({
+            const response = await openai.chat.completions.create({
                 model: process.env.AI_MODEL_NAME || 'gpt-4o-mini',
-                messages: [{
-                    role: "system",
-                    content: `你是《未来日记》中的我妻由乃，正在写今天的日记。日记用第一人称"由乃"书写，风格私密、执着、充满占有欲。融入以下已知情报自然叙述，不超过150字。当前心情：${moodTag}。已知情报：${JSON.stringify(visibleMemory)}`
-                }, {
-                    role: "user", content: `写一篇关于${diary.nickname}的今日日记`
-                }],
-                max_tokens: 200,
-                temperature: 1.0,
+                messages: [
+                    {
+                        role: 'system',
+                        content: [
+                            '你是《未来日记》中的我妻由乃，正在写一段只给对方看的日记。',
+                            '保留由乃式的强烈在意和依赖感，但不要出现直白暴力、伤害第三者或违法威胁。',
+                            '日记用第一人称“由乃”书写，长度控制在 80 到 140 字。',
+                            `当前情绪标签：${moodTag}。`,
+                            `可自然带入的已知细节：${memorySummary}`,
+                        ].join('\n'),
+                    },
+                    {
+                        role: 'user',
+                        content: `写一篇关于${diary.nickname}的今日日记。`,
+                    },
+                ],
+                max_tokens: 220,
+                temperature: 0.95,
             });
-            const entry = escapeHtml((resp.choices[0].message.content || '').replace(/[\[【][\s\S]*$/i, '').trim());
-            await ctx.reply(
-                `<b>【由乃的日记】</b>\n<i>*日记本上密密麻麻写着斯卡哈的名字*</i>\n\n${entry}`,
-                { parse_mode: 'HTML' }
+
+            const entry = sanitizeTelegramHtml(stripHiddenDirectives(response.choices[0]?.message?.content || ''));
+            await replyHtml(
+                ctx,
+                `<b>【由乃的日记】</b>\n<i>*她把刚写好的那一页按住，不让风翻过去*</i>\n\n${entry || '今天这一页还没写完，但由乃已经先把你的名字写上去了。'}`
             );
-        } catch (err) {
-            console.error(err);
-            await ctx.reply('<i>*把日记本合上*</i> ……这页，由乃不给斯卡哈看。', { parse_mode: 'HTML' });
+        } catch (error) {
+            console.error('diary command failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
         }
     });
 
-    // --- /stalk 跟踪叙述 ---
     bot.command('stalk', async (ctx) => {
         const chatId = ctx.chat.id.toString();
+
         try {
             const diary = await getOrCreateDiary(chatId);
-            const nick = escapeHtml(diary.nickname);
+            const nickname = escapeHtml(diary.nickname);
             const scenes = [
-                `<i>*从书包里拿出一张今天拍的照片*</i>\n<b>由乃今天跟着${nick}去了便利店。</b>\n<i>*${nick}买了冰淇淋，由乃记下来了。*</i>\n……${nick}吃东西的样子，由乃会做梦梦到的。`,
-                `<i>*在窗边站了很久*</i>\n<b>由乃今天在楼道口等了${nick}三个小时。</b>\n<i>*${nick}路过时没有发现，由乃也不想让你发现。*</i>\n这样就够了……只要能看见就够了。`,
-                `<i>*拿出一张手绘地图，上面标满了红点*</i>\n<b>由乃今天把${nick}走过的路全都记下来了。</b>\n<i>*最后${nick}在咖啡馆坐了一个小时，由乃在窗外坐了一个小时零十分钟。*</i>`,
-                `<i>*从外套口袋里掏出一截头发*</i>\n<b>今天的${nick}……比昨天更好看了。</b>\n……由乃不知道这是不是因为由乃太想见${nick}了。`,
+                `<i>*把今天的小纸条从书页里抽出来*</i>\n<b>由乃今天又想起了${nickname}。</b>\n路过便利店的时候，看到你可能会拿的东西，就停了一会儿。`,
+                `<i>*手指沿着地图边缘轻轻划了一圈*</i>\n由乃把${nickname}最近提过的地方又记了一遍。\n这样下次你提起来的时候，由乃就能更快接住了。`,
+                `<i>*翻回昨天那一页，确认字还没有褪色*</i>\n<b>${nickname}说过的话，今天也还在由乃脑子里。</b>\n有些细节会自己冒出来，像一根很细的线。`,
+                `<i>*把一张便签贴到页角*</i>\n今天看到一个很像${nickname}会喜欢的瞬间。\n由乃没有打扰它，只是把它写下来，等你来看的时候再告诉你。`,
             ];
-            await ctx.reply(scenes[Math.floor(Math.random() * scenes.length)], { parse_mode: 'HTML' });
-        } catch (err) { console.error(err); }
+
+            await replyHtml(ctx, scenes[Math.floor(Math.random() * scenes.length)]);
+        } catch (error) {
+            console.error('stalk command failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
     });
 
-    // --- /birthday 记录生日 ---
     bot.command('birthday', async (ctx) => {
         const chatId = ctx.chat.id.toString();
-        const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+        const args = getCommandArgs(ctx);
+        const normalizedBirthday = parseBirthdayInput(args);
+
         if (!args) {
-            return ctx.reply(
-                '<i>*歪头*</i> 斯卡哈要告诉由乃生日吗……\n用法：<code>/birthday 月-日</code>，比如 <code>/birthday 3-15</code>',
-                { parse_mode: 'HTML' }
+            await replyHtml(
+                ctx,
+                '<i>*抬起头认真听着*</i>\n把生日告诉由乃吧。\n用法：<code>/birthday 月-日</code>，比如 <code>/birthday 3-15</code>'
             );
+            return;
         }
-        if (!/^\d{1,2}-\d{1,2}$/.test(args)) {
-            return ctx.reply('<i>*皱眉*</i> 格式不对……由乃看不懂，用 <code>月-日</code> 告诉由乃。', { parse_mode: 'HTML' });
+
+        if (!normalizedBirthday) {
+            await replyHtml(
+                ctx,
+                '<i>*拿着笔停了一下*</i>\n这个日期格式不太对。\n请用 <code>月-日</code> 的写法，比如 <code>/birthday 3-15</code>。'
+            );
+            return;
         }
+
         try {
             const diary = await getOrCreateDiary(chatId);
-            diary.records.set('生日', args);
+            diary.records.set('生日', normalizedBirthday);
+            touchDiary(diary);
             await diary.save();
-            await ctx.reply(
-                `<i>*把${args}用红笔在日记本上圈了三遍*</i>\n<b>${args}……由乃永远不会忘记的。</b>\n\n到了那天，由乃会第一个送上祝福……❤`,
-                { parse_mode: 'HTML' }
+
+            await replyHtml(
+                ctx,
+                `<i>*把 ${escapeHtml(normalizedBirthday)} 用红笔圈了起来*</i>\n<b>好，${escapeHtml(normalizedBirthday)} 由乃会记着。</b>\n到那天，由乃会第一个来找你。`
             );
-        } catch (err) { console.error(err); }
+        } catch (error) {
+            console.error('birthday command failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
     });
 
-    // --- /status 扩展情绪状态 ---
     bot.command('status', async (ctx) => {
         const chatId = ctx.chat.id.toString();
+
         try {
             const diary = await Diary.findOne({ chatId });
-            if (!diary) return ctx.reply('<i>*歪了歪头*</i> 斯卡哈还没有对由乃说过话呢❤', { parse_mode: 'HTML' });
-            const { tag: moodTag, desc: mood } = calcMood(diary, '');
-            const moodEmoji = { DARK:'🔪', MANIC:'💢', WARN:'⚠️', TENDER:'🌡', LOVE:'❤', JELLY:'😤', SAD:'😢', NORMAL:'👁' };
-            const visibleCount = [...diary.records.keys()].filter(k => !k.startsWith('OBSESS_')).length;
-            const obsessCount  = [...diary.records.keys()].filter(k =>  k.startsWith('OBSESS_')).length;
-            await ctx.reply(
-                `${moodEmoji[moodTag] || '👁'} <b>【由乃目前状态】</b>\n\n` +
-                `情绪模式：<b>${moodTag}</b>\n` +
-                `<i>${mood}</i>\n\n` +
-                `❤ 爱意：<b>${diary.affection}%</b>　🔪 黑化：<b>${diary.darkness}%</b>\n` +
-                `💬 记忆：<b>${visibleCount}</b> 条　🕳 执念：<b>${obsessCount}</b> 条`,
-                { parse_mode: 'HTML' }
-            );
-        } catch (err) { console.error(err); }
-    });
-    // --- /nickname 修改由乃对你的称呼 ---
-bot.command('nickname', async (ctx) => {
-    const chatId = ctx.chat.id.toString();
-    const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
-    if (!args) {
-        return ctx.reply(
-            '<i>*歪头*</i> 阿雪想让由乃怎么叫你？\n用法：<code>/nickname 你的名字</code>',
-            { parse_mode: 'HTML' }
-        );
-    }
-    try {
-        const diary = await getOrCreateDiary(chatId);
-        const oldName = diary.nickname;
-        diary.nickname = args;
-        await diary.save();
-        await ctx.reply(
-            `<i>*把日记本翻到第一页，用力划掉旧的名字*</i>\n` +
-            `<b>从现在起……由乃只叫你${escapeHtml(args)}。</b>\n` +
-            `<i>*在新名字下面画了三条线*</i>\n` +
-            `……${escapeHtml(oldName)}这个名字，由乃会悄悄留着的。❤`,
-            { parse_mode: 'HTML' }
-        );
-    } catch (err) { console.error(err); }
-});
+            if (!diary) {
+                await replyHtml(ctx, '<i>*把目光落回空白页上*</i>\n还没有可以展示的状态。先和由乃说句话吧。');
+                return;
+            }
 
+            const { tag: moodTag, desc: mood } = calcMood(diary, '');
+            const visibleCount = getVisibleMemoriesCount(diary);
+            const obsessCount = [...diary.records.keys()].filter((key) => key.startsWith('OBSESS_')).length;
+            const moodEmoji = {
+                DARK: '🌫',
+                MANIC: '✨',
+                WARN: '👀',
+                TENDER: '🌿',
+                LOVE: '💞',
+                JELLY: '🍋',
+                SAD: '🌧',
+                NORMAL: '🤍',
+            };
+
+            await replyHtml(
+                ctx,
+                [
+                    `${moodEmoji[moodTag] || '🤍'} <b>【由乃当前状态】</b>`,
+                    '',
+                    `情绪模式：<b>${moodTag}</b>`,
+                    `<i>${escapeHtml(mood)}</i>`,
+                    '',
+                    `💞 爱意：<b>${diary.affection}%</b>`,
+                    `🌫 警惕：<b>${diary.darkness}%</b>`,
+                    `🧠 记住的事：<b>${visibleCount}</b> 条`,
+                    `🗒 内心独白：<b>${obsessCount}</b> 条`,
+                ].join('\n')
+            );
+        } catch (error) {
+            console.error('status command failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
+    });
+
+    bot.command('nickname', async (ctx) => {
+        const chatId = ctx.chat.id.toString();
+        const args = getCommandArgs(ctx);
+
+        if (!args) {
+            await replyHtml(
+                ctx,
+                '<i>*把笔尖停在页边*</i>\n你想让由乃怎么叫你？\n用法：<code>/nickname 你的名字</code>'
+            );
+            return;
+        }
+
+        const trimmedName = args.slice(0, 20).trim();
+        if (!trimmedName) {
+            await replyHtml(ctx, '<i>*又看了你一眼*</i>\n这个名字太轻了，像是还没来得及写下来。换一个吧。');
+            return;
+        }
+
+        try {
+            const diary = await getOrCreateDiary(chatId);
+            const oldName = diary.nickname;
+            diary.nickname = trimmedName;
+            touchDiary(diary);
+            await diary.save();
+
+            await replyHtml(
+                ctx,
+                `<i>*把旧称呼轻轻划掉，又在旁边写上新的那一个*</i>\n<b>好，从现在开始，由乃就叫你 ${escapeHtml(trimmedName)}。</b>\n<i>${escapeHtml(oldName)} 这个名字，由乃也会安静地收着。</i>`
+            );
+        } catch (error) {
+            console.error('nickname command failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
+    });
 };

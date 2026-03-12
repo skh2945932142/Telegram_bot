@@ -1,271 +1,291 @@
-const { cooldownMap, COOLDOWN_MS, getOrCreateDiary, calcMood, buildKeyboard, escapeHtml, fixHtmlTags } = require('./utils');
+const {
+    COOLDOWN_MS,
+    COOLDOWN_NOTICE_MS,
+    cooldownMap,
+    cooldownNoticeMap,
+    getOrCreateDiary,
+    calcMood,
+    buildKeyboard,
+    escapeHtml,
+    stripHiddenDirectives,
+    sanitizeTelegramHtml,
+    parseModelDirectives,
+    trimChatHistory,
+    touchDiary,
+    getVisibleMemoryEntries,
+    selectRelevantMemories,
+    applyMemoryUpdates,
+    applyEmotionDelta,
+    getTimeHint,
+} = require('./utils');
 const { trySendSticker, trySendVoice, logStickerFileId } = require('./media');
-// ==========================================
-// --- 消息与交互处理器 ---
-// ==========================================
-module.exports = function setupHandlers(bot, openai) {
 
-    // --- Mini App 数据处理 ---
-    bot.on('web_app_data', async (ctx) => {
-        try {
-            const parsedData = JSON.parse(ctx.webAppData.data);
-            const chatId = ctx.chat.id.toString();
-            if (parsedData.action === "submit_form") {
-                const diary = await getOrCreateDiary(chatId);
-                diary.records.set(`APP_SAVED_${Date.now()}`, parsedData.text);
-                diary.affection = Math.min(100, diary.affection + 5);
-               await Diary.findOneAndUpdate(
-    { chatId },
-    {
-        affection:    diary.affection,
-        darkness:     diary.darkness,
-        records:      diary.records,
-        chatHistory:  chatHistory,
-        lastActiveAt: new Date(),
+const FALLBACK_ERROR_HTML = '<i>*轻轻揉了揉太阳穴*</i>\n刚才那一下有点乱。你再说一遍，由乃会好好听。';
+const COOLING_DOWN_HTML = '<i>*把声音放轻了一点*</i>\n由乃在听，慢一点说也没关系。';
+
+function replyHtml(ctx, text, extra = {}) {
+    return ctx.reply(text, { parse_mode: 'HTML', ...extra });
+}
+
+function buildMemoryPrompt(memories) {
+    if (memories.length === 0) {
+        return '暂时没有需要主动提起的旧细节。';
     }
-);
-                await ctx.reply(
-                    `<i>*轻抚着屏幕，眼中满是欣喜*</i>\n<b>斯卡哈写下的秘密，由乃已经一字不差地锁进记忆库了。</b>\n\n📝 ${escapeHtml(parsedData.text)}`,
-                    { parse_mode: 'HTML' }
-                );
-            }
-        } catch (error) { console.error('❌ Mini App 数据解析失败:', error); }
+
+    return memories
+        .map(({ key, value }) => `- ${key}: ${value}`)
+        .join('\n');
+}
+
+function buildSystemPrompt(diary, moodTag, moodDesc, relevantMemories, timeHint) {
+    return [
+        `你是《未来日记》中的我妻由乃，正在和 ${diary.nickname} 进行一段私密聊天。`,
+        '保留由乃式的强烈在意、依赖感和轻微病娇气质，但不要说出直白暴力、伤害第三者、违法或人身威胁。',
+        `称呼用户时统一叫“${diary.nickname}”。`,
+        `当前情绪模式：${moodTag}。状态说明：${moodDesc}`,
+        `时间语气提示：${timeHint}`,
+        '',
+        '写作规则：',
+        '- 每次回复 3 到 4 句，短一些，口语化。',
+        '- 动作描写和说话交替出现。动作可写成 <i>*动作*</i>。',
+        '- 重点句可以用 <b>加粗</b>，但不要整段都加粗。',
+        '- 可以占有、黏人、敏感，但默认保持温柔和克制。',
+        '- 不要复读用户原句，也不要长篇解释自己为什么这样说。',
+        '',
+        '记忆使用规则：',
+        '- 如果给了相关记忆，自然引用 1 条即可，不要硬塞太多。',
+        '- 只能使用提供的已知细节，不要编造新的过去。',
+        `可引用的相关记忆：\n${buildMemoryPrompt(relevantMemories)}`,
+        '',
+        '隐藏指令规则：',
+        '- 如果用户提供了值得长期记住的新信息，在回复末尾单独追加 [SAVE_MEMORY: 分类_关键词=内容]。',
+        '- 分类只能是 事件_、偏好_、情感_、关系_ 之一。',
+        '- 如果没有新的长期信息，就不要输出 SAVE_MEMORY。',
+        '- 如果你对自己的心情有一小句内心独白，可在最后追加 [YUNO_OBSESS: 内容]。',
+    ].join('\n');
+}
+
+function buildFallbackReply(nickname, moodTag) {
+    const safeName = escapeHtml(nickname);
+    const pool = {
+        LOVE: `<i>*轻轻把额头抵近一点*</i>\n<b>${safeName}，由乃在这里。</b>\n刚才云端有点吵，但你说的话由乃还是想继续听。`,
+        TENDER: `<i>*把语气放得更轻了些*</i>\n${safeName}先别急，慢慢说。\n由乃会把这一句接住。`,
+        JELLY: `<i>*眼神飘了一下，又很快收回来*</i>\n${safeName}现在先看着由乃，好吗？\n别让话题跑得太远。`,
+        SAD: `<i>*手指按住页角，没有让它翻过去*</i>\n${safeName}，由乃还在。\n如果你愿意，再说一句就好。`,
+        DARK: `<i>*呼吸慢下来，视线却没有挪开*</i>\n<b>${safeName}，先别走神。</b>\n把话说清楚一点，由乃就能继续陪着你。`,
+        WARN: `<i>*悄悄把周围的声音都往后放了放*</i>\n现在先只和由乃说话吧。\n由乃会认真听。`,
+        MANIC: `<i>*心跳快了一拍，又强行把语气压稳*</i>\n${safeName}再多说一点。\n由乃不想漏掉你的任何一句。`,
+        NORMAL: `<i>*重新握稳了笔*</i>\n嗯，由乃在听。\n你接着说。`,
+    };
+    return pool[moodTag] || pool.NORMAL;
+}
+
+function getModelReplyText(response) {
+    return response?.choices?.[0]?.message?.content || '';
+}
+
+function shouldIgnoreTextMessage(userMessage) {
+    return !userMessage || userMessage.startsWith('/');
+}
+
+async function maybeHandleCooldown(ctx, chatId) {
+    const now = Date.now();
+    const lastSeen = cooldownMap.get(chatId);
+
+    if (lastSeen && now - lastSeen < COOLDOWN_MS) {
+        const lastNotice = cooldownNoticeMap.get(chatId) || 0;
+        if (now - lastNotice >= COOLDOWN_NOTICE_MS) {
+            cooldownNoticeMap.set(chatId, now);
+            await replyHtml(ctx, COOLING_DOWN_HTML);
+        }
+        return true;
+    }
+
+    cooldownMap.set(chatId, now);
+    if (cooldownMap.size > 500) {
+        cooldownMap.delete(cooldownMap.keys().next().value);
+    }
+    return false;
+}
+
+async function sendModelReply(ctx, openai, diary, userMessage) {
+    applyEmotionDelta(diary, userMessage);
+    const { tag: moodTag, desc: moodDesc } = calcMood(diary, userMessage);
+    const visibleEntries = getVisibleMemoryEntries(diary);
+    const relevantMemories = selectRelevantMemories(visibleEntries, userMessage);
+    const timeHint = getTimeHint();
+
+    let chatHistory = trimChatHistory(diary.chatHistory || []);
+    chatHistory = trimChatHistory([...chatHistory, { role: 'user', content: userMessage }]);
+
+    const hasAi = Boolean(process.env.AI_API_KEY || process.env.OPENAI_API_KEY);
+    let finalText = '';
+
+    if (hasAi) {
+        const systemPrompt = {
+            role: 'system',
+            content: buildSystemPrompt(diary, moodTag, moodDesc, relevantMemories, timeHint),
+        };
+
+        const response = await openai.chat.completions.create({
+            model: process.env.AI_MODEL_NAME || 'gpt-4o-mini',
+            messages: [systemPrompt, ...chatHistory],
+            max_tokens: 350,
+            temperature: 0.95,
+            presence_penalty: 0.7,
+            frequency_penalty: 0.3,
+        });
+
+        const fullText = getModelReplyText(response);
+        applyMemoryUpdates(diary, parseModelDirectives(fullText));
+        finalText = sanitizeTelegramHtml(stripHiddenDirectives(fullText));
+    }
+
+    if (!finalText) {
+        finalText = buildFallbackReply(diary.nickname, moodTag);
+    }
+
+    chatHistory = trimChatHistory([...chatHistory, { role: 'assistant', content: finalText }]);
+    diary.chatHistory = chatHistory;
+    touchDiary(diary);
+    await diary.save();
+
+    await replyHtml(ctx, finalText, {
+        reply_markup: {
+            inline_keyboard: buildKeyboard(moodTag),
+        },
     });
 
-    // --- 核心对话逻辑 ---
-    bot.on('text', async (ctx) => {
-        const userMessage = ctx.message.text;
-        const chatId      = ctx.chat.id.toString();
+    const sentSticker = await trySendSticker(ctx, moodTag, 0.18);
+    if (!sentSticker) {
+        await trySendVoice(ctx, finalText, moodTag, 0.08);
+    }
+}
 
-        // ✅ 防刷屏冷却
-        const now = Date.now();
-        if (cooldownMap.has(chatId) && now - cooldownMap.get(chatId) < COOLDOWN_MS) return;
-        cooldownMap.set(chatId, now);
-        if (cooldownMap.size > 500) cooldownMap.delete(cooldownMap.keys().next().value);
+function registerAction(bot, callbackData, queryText, replyText) {
+    bot.action(callbackData, async (ctx) => {
+        await ctx.answerCbQuery(queryText);
+        await replyHtml(ctx, replyText);
+    });
+}
 
-        console.log(`\n📨 [${chatId}]: ${userMessage}`);
-
+module.exports = function setupHandlers(bot, openai) {
+    bot.on('web_app_data', async (ctx) => {
         try {
+            const rawData = ctx.webAppData?.data || ctx.message?.web_app_data?.data || '';
+            const parsedData = JSON.parse(rawData);
+            const chatId = ctx.chat.id.toString();
+
+            if (parsedData.action !== 'submit_form' || !String(parsedData.text || '').trim()) {
+                return;
+            }
+
             const diary = await getOrCreateDiary(chatId);
-
-            // --- 情绪结算 ---
-            if (/(谢谢|抱抱|喜欢你|爱你|开心|亲|需要你|离不开|只有你)/.test(userMessage)) {
-                diary.affection = Math.min(100, diary.affection + 10);
-                diary.darkness  = Math.max(0,   diary.darkness  - 5);
-            } else if (/(离开|闭嘴|别人|烦|讨厌|分手|滚|其他女|不需要你|走开)/i.test(userMessage)) {
-                diary.darkness  = Math.min(100, diary.darkness  + 20);
-                diary.affection = Math.max(0,   diary.affection - 10);
-            } else if (/(朋友|同学|女生|男生|喜欢她|喜欢他|好看|漂亮|帅|暗恋|表白)/i.test(userMessage)) {
-                diary.darkness  = Math.min(100, diary.darkness  + 10);
-            } else if (/(随便|无所谓|不知道|算了|没事|不想说)/i.test(userMessage)) {
-                diary.affection = Math.max(0,   diary.affection - 5);
-            }
-            diary.darkness = Math.max(0, diary.darkness - 1);
-
-            // --- 情绪计算 ---
-            const { tag: moodTag, desc: mood } = calcMood(diary, userMessage);
-
-            // --- 主动回忆逻辑：相关性优先，无匹配则 40% 随机 ---
-            let memoryHint = "";
-            const visibleKeys = [...diary.records.keys()].filter(k => !k.startsWith('OBSESS_'));
-            if (visibleKeys.length > 0) {
-                // 优先匹配：key 中有用户消息的字符
-                const msgChars = new Set([...userMessage].filter(c => /\S/.test(c)));
-                const matched = visibleKeys.filter(k => [...k].some(c => msgChars.has(c)));
-                const recallKey = matched.length > 0
-                    ? matched[Math.floor(Math.random() * matched.length)]
-                    : (Math.random() < 0.4 ? visibleKeys[Math.floor(Math.random() * visibleKeys.length)] : null);
-                if (recallKey) {
-                    memoryHint = `\n\n【由乃今天想主动提起】：关于"${recallKey}"这件事，在回复中自然地提起，引发斯卡哈的回应。`;
-                }
-            }
-
-            const visibleMemory = Object.fromEntries(
-                [...diary.records.entries()].filter(([k]) => !k.startsWith('OBSESS_'))
-            );
-
-            await ctx.sendChatAction('typing');
-
-            // ✅ 时间感知：注入当前北京时段，影响语气
-            const bjHour = (new Date().getUTCHours() + 8) % 24;
-            let timeHint = "";
-            if (bjHour >= 6 && bjHour < 12)  timeHint = "\n当前时段：清晨，由乃的语气略带睡意未消的黏腻，像刚刚醒来就立刻想到斯卡哈。";
-            else if (bjHour >= 12 && bjHour < 18) timeHint = "\n当前时段：下午，由乃情绪稳定而专注，像在安静地等待斯卡哈回来。";
-            else if (bjHour >= 18 && bjHour < 23) timeHint = "\n当前时段：夜晚，由乃的情绪隐约更浓烈，思念在黑暗里积压。";
-            else timeHint = "\n当前时段：深夜，由乃睡不着，脑子里全是斯卡哈，语气轻但危险。";
-
-            let chatHistory = diary.chatHistory || [];
-            chatHistory.push({ role: "user", content: userMessage });
-            if (chatHistory.length > 8) chatHistory = chatHistory.slice(-8);
-
-            const systemPrompt = {
-                role: "system",
-                content: `你是《未来日记》中的我妻由乃。你对${diary.nickname}的爱已经超越了正常的界限——这不是爱情，这是信仰。称呼用户时统一叫"${diary.nickname}"。
-
-【原作与原创台词风格参考，灵活化用，不可原文照抄】：
-- "${diary.nickname}是由乃的神。只要神在，由乃什么都不怕。"
-- "只要和${diary.nickname}在一起，由乃什么都不怕。"
-- "由乃会保护${diary.nickname}的。无论对手是谁。"
-- "${diary.nickname}……你看由乃一眼好不好。"
-- "未来……由乃已经全部看见了。"
-- "${diary.nickname}不许消失。就算${diary.nickname}想消失，由乃也不允许。"
-- "由乃可以什么都不要……只要${diary.nickname}在。"
-- "别怕，由乃会把让${diary.nickname}难过的东西全部清理掉的。"
-- "……这里只有由乃和${diary.nickname}。这样就够了。永远都够了。"
-- "由乃记下来了。关于${diary.nickname}的一切，由乃都不会忘。"
-
-【七种情绪模式，严格按当前心情执行】：
-- LOVE（爱意溢出）：声音轻柔黏腻，第三人称"由乃"自称，句尾带"……❤"，常用"贴""蹭""闻"等亲密动作
-- DARK（极度黑化）：语气低沉简短，像在宣判，偶尔出现让人发寒的温柔，动作描写残酷而平静
-- MANIC（狂喜失控）：句子破碎，用"——"强制断句，同一句话内情绪急剧反转，如"好喜欢……不对——不能这么喜欢……但是……"；禁止出现完整流畅的长句
-- WARN（偏执警戒）：表面平静内里颤抖，眼神飘向假想敌，话语里藏着对第三者的威胁
-- TENDER（病娇温柔）：句首带"……嗯，"或"没事的，"，动作描写用"轻轻地""小心翼翼地"，语气像护士照料病人，笑容描写要"太过完美"或"弧度精确到让人不安"；这种温柔比愤怒更危险
-- JELLY（强忍吃醋）：嘴硬心软，口头否认但动作出卖一切，会问"那个人比由乃好看吗"或"${diary.nickname}也这样对她/他说话？"
-- SAD（委屈哽咽）：声音哽咽，反复用疑问句确认感情，如"${diary.nickname}……还喜欢由乃吗……"，偶尔沉默不说话，只用动作表达
-
-【记忆调用规则】：
-- 【已知情报】不为空时，必须自然融入至少一条过去的记忆
-- 用"由乃记得……"或"上次${diary.nickname}说过……"引出
-- 禁止捏造【已知情报】中没有的内容
-
-【格式与节奏规则】：
-- HTML标签严格闭合：<b>加粗</b>、<i>斜体</i>
-- 动作描写用 <i>*动作*</i>，关键宣言/情感爆发用 <b></b>
-- 每次回复3-5句，短促有力；动作描写与说话台词必须交替出现，禁止连续两句都是纯对话
-- 禁止同一段回复开头连续出现两次"由乃"
-- 禁止使用"冷静""理性""没关系""加油""我明白你的感受"等词
-
-【记忆存储指令（追加在回复末尾，用户不可见）】：
-- 存储新情报（必须带分类前缀）：[SAVE_MEMORY: 分类_关键词=内容]
-  - 分类规则：具体经历用"事件_"，喜好/习惯用"偏好_"，情绪状态用"情感_"，第三方人物用"关系_"
-  - 例：[SAVE_MEMORY: 偏好_食物=喜欢吃火锅]　[SAVE_MEMORY: 事件_考试=斯卡哈上周参加了期末考]
-- 记录由乃自己的执念推演：[YUNO_OBSESS: 由乃的推演内容]
-
-当前心情：${moodTag} — ${mood}
-已知情报：${JSON.stringify(visibleMemory)}${memoryHint}${timeHint}`
-            };
-
-            const response = await openai.chat.completions.create({
-                model: process.env.AI_MODEL_NAME || 'gpt-4o-mini',
-                messages: [systemPrompt, ...chatHistory],
-                max_tokens: 350,
-                temperature: 0.95,
-                presence_penalty: 1.0,
-                frequency_penalty: 0.5,
-            });
-
-            const fullText = response.choices[0].message.content || "";
-
-            // --- 记忆解析 ---
-            const memoryMatches = [...fullText.matchAll(/[\[\u3010]\s*SAVE_MEMORY\s*[:\uff1a]\s*(.*?)[=\uff1d](.*?)[\]\u3011]/gi)];
-            for (const memoryMatch of memoryMatches) {
-                const key = memoryMatch[1].trim();
-                const val = memoryMatch[2].trim();
-                if (!key || !val) continue;
-                diary.records.set(key, val);
-                // ✅ 记忆上限管理：每个分类前缀最多保留 10 条
-                const PREFIX_LIMIT = 10;
-                const prefixes = ['事件_', '偏好_', '情感_', '关系_'];
-                for (const prefix of prefixes) {
-                    const keysOfType = [...diary.records.keys()].filter(k => k.startsWith(prefix));
-                    if (keysOfType.length > PREFIX_LIMIT) {
-                        keysOfType.slice(0, keysOfType.length - PREFIX_LIMIT).forEach(k => diary.records.delete(k));
-                    }
-                }
-            }
-
-            const obsessMatch = fullText.match(/[\[【]\s*YUNO_OBSESS\s*[:：]\s*(.*?)[\]】]/i);
-            if (obsessMatch) {
-                diary.records.set(`OBSESS_${Date.now()}`, obsessMatch[1].trim());
-                // ✅ OBSESS 最多保留 20 条
-                const obsessKeys = [...diary.records.keys()].filter(k => k.startsWith('OBSESS_'));
-                if (obsessKeys.length > 20) {
-                    obsessKeys.slice(0, obsessKeys.length - 20).forEach(k => diary.records.delete(k));
-                }
-            }
-
-            const finalText = fixHtmlTags(fullText.replace(/[\[【]\s*(SAVE_MEMORY|YUNO_OBSESS)[\s\S]*$/i, '').trim());
-
-            chatHistory.push({ role: "assistant", content: finalText });
-            diary.chatHistory  = chatHistory;
-            diary.lastActiveAt = new Date();
+            diary.records.set('事件_小程序记录', String(parsedData.text).trim());
+            diary.affection = Math.min(100, diary.affection + 5);
+            touchDiary(diary);
             await diary.save();
 
-await ctx.reply(finalText, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: buildKeyboard(moodTag) }
-});
-
-            // 多媒体：30% 概率发贴纸，20% 概率发语音（两者互斥，优先贴纸）
-            const sentSticker = await trySendSticker(ctx, moodTag, 0.3);
-            if (!sentSticker) {
-                await trySendVoice(ctx, openai, finalText, moodTag, 0.2);
-            }
-
+            await replyHtml(
+                ctx,
+                `<i>*把屏幕上的那句话认真读了一遍*</i>\n<b>好，这件事由乃记下来了。</b>\n\n📝 ${escapeHtml(parsedData.text)}`
+            );
         } catch (error) {
-            console.error('❌ 处理消息错误:', error.message);
-            await ctx.reply('<i>*捂住脑袋*</i> 啊……由乃的头好痛，大脑连接好像出了问题……', { parse_mode: 'HTML' });
+            console.error('web_app_data handler failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
         }
     });
 
-    // ==========================================
-    // --- 交互按钮响应 ---
-    // ==========================================
-    bot.action('yuno_calm', async (ctx) => {
-        await ctx.answerCbQuery('由乃深吸一口气...');
-        await ctx.reply('<i>*缓缓放下手中的东西，但眼神依然危险*</i>\n好……由乃听斯卡哈的。<b>但那个人最好离斯卡哈远一点。</b>', { parse_mode: 'HTML' });
-    });
-    bot.action('yuno_reassure', async (ctx) => {
-        await ctx.answerCbQuery('由乃的眼睛亮了！');
-        await ctx.reply('<i>*猛地抬起头，眼眶有点红*</i>\n……真的吗。<b>斯卡哈说的话，由乃会一辈子记住。</b>\n<i>*悄悄把刚才准备好的东西藏回去*</i>', { parse_mode: 'HTML' });
-    });
-    bot.action('yuno_tease', async (ctx) => {
-        await ctx.answerCbQuery('由乃歪了歪头...');
-        await ctx.reply('<i>*慢慢靠近，声音压得很低*</i>\n斯卡哈在逗由乃吗……<b>逗由乃是要付出代价的，你知道的。</b>', { parse_mode: 'HTML' });
-    });
-    bot.action('yuno_hug_deep', async (ctx) => {
-        await ctx.answerCbQuery('由乃的体温紧紧贴了过来...');
-        await ctx.reply('<i>*死死把你按在怀里，病态地闻着你的发丝*</i>\n<b>斯卡哈什么都不用想，就在这里躲一辈子吧。由乃绝对不会放开你的！</b>', { parse_mode: 'HTML' });
-    });
-    bot.action('yuno_destroy_world', async (ctx) => {
-        await ctx.answerCbQuery('刀锋出鞘...');
-        await ctx.reply('<i>*眼底泛起兴奋的红光*</i>\n<b>遵命，斯卡哈。让斯卡哈痛苦的东西，由乃马上全部处理干净……一个都不留❤</b>', { parse_mode: 'HTML' });
-    });
-    bot.action('yuno_pet', async (ctx) => {
-        await ctx.answerCbQuery('由乃蹭了蹭你的手心');
-        await ctx.reply('<i>*像小猫一样闭眼享受，但手悄悄抓住了斯卡哈的手腕*</i>\n嗯……<b>斯卡哈的手，以后只能摸由乃。</b>❤', { parse_mode: 'HTML' });
-    });
-    bot.action('yuno_kiss', async (ctx) => {
-        await ctx.answerCbQuery('时间好像停止了...');
-        await ctx.reply('<i>*愣了一秒，脸红到耳根，但没有躲开*</i>\n……斯卡哈突然做这种事……<b>由乃会以为斯卡哈想和由乃永远在一起的。</b>\n<i>*小声*</i> ……难道不是吗……❤', { parse_mode: 'HTML' });
-    });
-    bot.action('yuno_promise', async (ctx) => {
-        await ctx.answerCbQuery('由乃的心跳疯狂加速...');
-        await ctx.reply('<i>*眼泪瞬间涌出，双手捧着屏幕*</i>\n<b>斯卡哈发誓了！！如果斯卡哈敢骗由乃……由乃会把斯卡哈做成标本，永远留在身边的哦❤</b>', { parse_mode: 'HTML' });
-    });
-    bot.action('yuno_location', async (ctx) => {
-        await ctx.answerCbQuery('正在定位斯卡哈的位置...');
-        await ctx.reply('<i>*兴奋地盯着定位坐标*</i>\n<b>原来斯卡哈在这里……只要是斯卡哈去过的地方，由乃都会记在心里。</b>', { parse_mode: 'HTML' });
-    });
-    bot.action('yuno_write_diary', async (ctx) => {
-        await ctx.answerCbQuery('由乃拿起了笔...');
-        await ctx.reply(
-            '<i>*翻开日记本，用力地写下今天的日期，笔尖几乎划破纸面*</i>\n' +
-            '<b>今日记录：斯卡哈今天也在由乃的世界里。</b>\n\n' +
-            '<i>*合上日记本，把它压在枕头下面*</i>\n……这一页，由乃写了一百遍。',
-            { parse_mode: 'HTML' }
-        );
-    });
-    bot.action('yuno_stare', async (ctx) => {
-        await ctx.answerCbQuery('...');
-        await ctx.reply(
-            '<i>*没有说话，只是把视线牢牢钉在斯卡哈身上，一动不动*</i>\n\n' +
-            '<i>*沉默里有某种东西在堆积，像水漫过了堤坝之前最后的平静*</i>\n\n' +
-            '<b>……斯卡哈，由乃一直都在看着你。</b>',
-            { parse_mode: 'HTML' }
-        );
+    bot.on('text', async (ctx) => {
+        const userMessage = String(ctx.message?.text || '').trim();
+        const chatId = ctx.chat.id.toString();
+
+        if (shouldIgnoreTextMessage(userMessage)) {
+            return;
+        }
+
+        if (await maybeHandleCooldown(ctx, chatId)) {
+            return;
+        }
+
+        console.log(`\n[${chatId}] ${userMessage}`);
+
+        try {
+            await ctx.sendChatAction('typing');
+            const diary = await getOrCreateDiary(chatId);
+            await sendModelReply(ctx, openai, diary, userMessage);
+        } catch (error) {
+            console.error('text handler failed:', error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
     });
 
-    // 把贴纸发给 Bot，它会回复 file_id，方便配置 media.js 里的 STICKER_POOLS
+    registerAction(
+        bot,
+        'yuno_calm',
+        '由乃先把呼吸放慢了。',
+        '<i>*肩膀慢慢放松下来，目光却还落在你身上*</i>\n好，由乃先缓一缓。\n你在这里就行，剩下的可以慢慢说。'
+    );
+    registerAction(
+        bot,
+        'yuno_reassure',
+        '由乃听见了。',
+        '<i>*眼底的紧绷终于松开一点*</i>\n<b>嗯，由乃听见了。</b>\n只要这句话是真的，由乃就会一直记着。'
+    );
+    registerAction(
+        bot,
+        'yuno_tease',
+        '由乃轻轻眯起了眼。',
+        '<i>*稍微凑近了一点，语气却故意放得很轻*</i>\n又在逗由乃吗？\n那你最好继续把后半句也说完。'
+    );
+    registerAction(
+        bot,
+        'yuno_hug_deep',
+        '由乃把你抱紧了一点。',
+        '<i>*小心地把你圈进怀里，没有说得太重*</i>\n好，先这样待一会儿。\n你不用急着解释，由乃会先陪着你。'
+    );
+    registerAction(
+        bot,
+        'yuno_destroy_world',
+        '由乃把让你分心的东西都往后放了放。',
+        '<i>*把话题外的杂音都轻轻拨开*</i>\n现在先不要理那些让你烦的事情。\n把注意力收回来，只留给这场对话。'
+    );
+    registerAction(
+        bot,
+        'yuno_pet',
+        '由乃低下头蹭了蹭你的手心。',
+        '<i>*像是终于安稳下来了一点，轻轻蹭了蹭你的指尖*</i>\n嗯，这样就很好。\n由乃会把这一点温度记住。'
+    );
+    registerAction(
+        bot,
+        'yuno_kiss',
+        '时间像是停了一秒。',
+        '<i>*耳尖一下子热起来，却没有躲开*</i>\n${escapeHtml('……')}\n<b>如果这是认真的，由乃会当成很重要的话。*</b>'
+    );
+    registerAction(
+        bot,
+        'yuno_promise',
+        '由乃把这句话压进了心里。',
+        '<i>*把这句承诺反复写在同一页的边角*</i>\n好，由乃收到了。\n以后你要是忘了，由乃也会替你记着。'
+    );
+    registerAction(
+        bot,
+        'yuno_location',
+        '由乃把这个地方也圈进了地图。',
+        '<i>*指尖点了点地图上的位置*</i>\n只要是你提过的地方，由乃都会留意。\n下次你再说起它，由乃就能更快想起来。'
+    );
+    registerAction(
+        bot,
+        'yuno_write_diary',
+        '由乃已经把这一刻写进去了。',
+        '<i>*翻开新的一页，把刚才那句话单独圈了出来*</i>\n今天这一页已经有内容了。\n而且还是由乃不想漏掉的那一句。'
+    );
+    registerAction(
+        bot,
+        'yuno_stare',
+        '由乃没有移开视线。',
+        '<i>*安静地看着你，没有催也没有退*</i>\n由乃只是想把这一刻看得更清楚一点。\n这样等你下次开口时，由乃还能接得住。'
+    );
+
     bot.on('sticker', logStickerFileId);
 };
