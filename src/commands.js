@@ -195,4 +195,29 @@ module.exports = function setupCommands(bot, _openai) {
             );
         } catch (err) { console.error(err); }
     });
+    // --- /nickname 修改由乃对你的称呼 ---
+bot.command('nickname', async (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+    if (!args) {
+        return ctx.reply(
+            '<i>*歪头*</i> 阿雪想让由乃怎么叫你？\n用法：<code>/nickname 你的名字</code>',
+            { parse_mode: 'HTML' }
+        );
+    }
+    try {
+        const diary = await getOrCreateDiary(chatId);
+        const oldName = diary.nickname;
+        diary.nickname = args;
+        await diary.save();
+        await ctx.reply(
+            `<i>*把日记本翻到第一页，用力划掉旧的名字*</i>\n` +
+            `<b>从现在起……由乃只叫你${escapeHtml(args)}。</b>\n` +
+            `<i>*在新名字下面画了三条线*</i>\n` +
+            `……${escapeHtml(oldName)}这个名字，由乃会悄悄留着的。❤`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (err) { console.error(err); }
+});
+
 };
