@@ -144,7 +144,7 @@ module.exports = function setupCommands(bot, openai) {
             const diary = await getOrCreateDiary(chatId);
             diary.affection = DEFAULT_AFFECTION;
             diary.darkness = DEFAULT_DARKNESS;
-            diary.records = {};
+            diary.records = new Map();
             diary.chatHistory = [];
             if (!diary.nickname || diary.nickname === DEFAULT_NICKNAME) {
                 diary.nickname = String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME;

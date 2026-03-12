@@ -260,7 +260,7 @@ module.exports = function setupHandlers(bot, openai) {
         bot,
         'yuno_kiss',
         '时间像是停了一秒。',
-        '<i>*耳尖一下子热起来，却没有躲开*</i>\n${escapeHtml('……')}\n<b>如果这是认真的，由乃会当成很重要的话。*</b>'
+        '<i>*耳尖一下子热起来，却没有躲开*</i>\n……\n<b>如果这是认真的，由乃会当成很重要的话。</b>'
     );
     registerAction(
         bot,

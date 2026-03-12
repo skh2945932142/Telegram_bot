@@ -231,20 +231,29 @@ function getVisibleMemoryEntries(diary) {
 }
 
 function buildSearchTokens(text) {
-    const matches = String(text || '')
-        .toLowerCase()
-        .match(/[\p{Script=Han}]{2,}|[a-z0-9]{2,}/gu);
+    const source = String(text || '').toLowerCase();
+    const tokens = new Set();
+    const matches = source.match(/[\p{Script=Han}]{2,}|[a-z0-9]{2,}/gu) || [];
 
-    if (matches && matches.length > 0) {
-        return Array.from(new Set(matches));
+    for (const match of matches) {
+        tokens.add(match);
+
+        if (/^[\p{Script=Han}]+$/u.test(match) && match.length > 2) {
+            const maxLength = Math.min(match.length, 6);
+            for (let length = 2; length <= maxLength; length += 1) {
+                for (let index = 0; index <= match.length - length; index += 1) {
+                    tokens.add(match.slice(index, index + length));
+                }
+            }
+        }
     }
 
-    const fallback = String(text || '').trim();
-    if (fallback.length >= 2) {
-        return [fallback.toLowerCase()];
+    if (tokens.size > 0) {
+        return [...tokens];
     }
 
-    return [];
+    const fallback = source.trim();
+    return fallback.length >= 2 ? [fallback] : [];
 }
 
 function selectRelevantMemories(entries, userMessage, limit = RELEVANT_MEMORY_LIMIT) {
