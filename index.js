@@ -8,8 +8,14 @@ const { OpenAI } = require('openai');
 
 const {
     Diary,
+    ensureDiaryState,
     escapeHtml,
+    getBirthday,
     getMonthDayInTimezone,
+    getPreferredDisplayName,
+    getLegacyRecord,
+    setLegacyRecord,
+    syncDiaryCompatibilityFields,
     touchDiary,
 } = require('./src/utils');
 const setupCommands = require('./src/commands');
@@ -107,6 +113,7 @@ const sweetNightMessages = [
 ];
 
 function selectMessagePool(diary, baseMessages, guardedMessages, sweetMessages) {
+    ensureDiaryState(diary);
     if (diary.darkness > 70 && guardedMessages.length > 0) {
         return guardedMessages;
     }
@@ -118,10 +125,10 @@ function selectMessagePool(diary, baseMessages, guardedMessages, sweetMessages) 
 
 function pickMessageIndex(diary, slotKey, pool) {
     const recordKey = `SYS_LAST_PUSH_${slotKey}`;
-    const lastIndex = Number(diary.records.get(recordKey));
+    const lastIndex = Number(getLegacyRecord(diary, recordKey));
 
     if (pool.length <= 1) {
-        diary.records.set(recordKey, '0');
+        setLegacyRecord(diary, recordKey, '0');
         return 0;
     }
 
@@ -130,7 +137,7 @@ function pickMessageIndex(diary, slotKey, pool) {
         nextIndex = (nextIndex + 1) % pool.length;
     }
 
-    diary.records.set(recordKey, String(nextIndex));
+    setLegacyRecord(diary, recordKey, String(nextIndex));
     return nextIndex;
 }
 
@@ -141,12 +148,13 @@ async function sendScheduledMessages(slotKey, baseMessages, guardedMessages, swe
         const today = getMonthDayInTimezone(new Date(), APP_TIME_ZONE);
 
         for (const diary of activeDiaries) {
-            const birthday = diary.records?.get('生日');
+            ensureDiaryState(diary);
+            const birthday = getBirthday(diary);
 
             if (birthday && birthday === today) {
                 const birthdayMessage = [
                     '<i>*把这一页单独折了个角，像是早就准备好了*</i>',
-                    `<b>今天是 ${escapeHtml(diary.nickname)} 的生日。</b>`,
+                    `<b>今天是 ${escapeHtml(getPreferredDisplayName(diary))} 的生日。</b>`,
                     '这件事由乃一直记着。',
                     '生日快乐，今天也请把一句话留给由乃。',
                 ].join('\n');
@@ -154,8 +162,9 @@ async function sendScheduledMessages(slotKey, baseMessages, guardedMessages, swe
                 await bot.telegram
                     .sendMessage(diary.chatId, birthdayMessage, { parse_mode: 'HTML' })
                     .catch((error) => console.error(`birthday push failed [${diary.chatId}]:`, error.message));
-                diary.records.set(`SYS_LAST_PUSH_${slotKey}`, 'birthday');
+                setLegacyRecord(diary, `SYS_LAST_PUSH_${slotKey}`, 'birthday');
                 touchDiary(diary);
+                syncDiaryCompatibilityFields(diary);
                 await diary.save().catch((error) => console.error(`save after birthday push failed [${diary.chatId}]:`, error.message));
                 await new Promise((resolve) => setTimeout(resolve, 120));
                 continue;
@@ -170,6 +179,7 @@ async function sendScheduledMessages(slotKey, baseMessages, guardedMessages, swe
                 .catch((error) => console.error(`scheduled push failed [${diary.chatId}]:`, error.message));
 
             touchDiary(diary);
+            syncDiaryCompatibilityFields(diary);
             await diary.save().catch((error) => console.error(`save after scheduled push failed [${diary.chatId}]:`, error.message));
             await new Promise((resolve) => setTimeout(resolve, 120));
         }

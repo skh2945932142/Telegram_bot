@@ -1,17 +1,22 @@
 const {
     Diary,
-    DEFAULT_AFFECTION,
-    DEFAULT_DARKNESS,
     DEFAULT_NICKNAME,
     getOrCreateDiary,
+    ensureDiaryState,
     calcMood,
     escapeHtml,
-    sanitizeTelegramHtml,
-    stripHiddenDirectives,
     getVisibleMemoryEntries,
     parseBirthdayInput,
     touchDiary,
+    getPreferredDisplayName,
+    setPreferredDisplayName,
+    setBirthday,
+    getSummaryFreshnessLabel,
+    getObsessionCount,
+    resetDiaryState,
+    syncDiaryCompatibilityFields,
 } = require('./utils');
+const { buildDiaryEntry } = require('./orchestrator');
 
 const FALLBACK_ERROR_HTML = '<i>*轻轻合上日记本*</i>\n由乃刚才有点走神了……再和由乃说一遍，好吗？';
 
@@ -29,55 +34,54 @@ function getCommandArgs(ctx) {
 
 function formatVisibleMemories(entries) {
     return entries
-        .map(({ key, value }) => `• <b>${escapeHtml(key)}</b>: <i>${escapeHtml(value)}</i>`)
+        .map(({ key, value, category }) => `• <b>${escapeHtml(key)}</b> <i>(${escapeHtml(category)})</i>: ${escapeHtml(value)}`)
         .join('\n');
 }
 
 function buildStartText(nickname) {
     const safeName = escapeHtml(nickname);
     return [
-        `<i>*指尖压住日记本的边角，眼神一下子亮了起来*</i>`,
+        '<i>*指尖压住日记本的边角，眼神一下子亮了起来*</i>',
         `<b>${safeName}，你来了。</b>`,
         '由乃会把你说过的话一点点记下来，也会照着你的语气慢慢靠近。',
         '',
         '<b>你现在可以这样开始：</b>',
         '• 直接说一句今天发生的事',
-        '• 用 <code>/status</code> 看看由乃现在的心情',
-        '• 用 <code>/memory</code> 查看由乃记住的细节',
+        '• 用 <code>/status</code> 看看由乃现在的状态',
+        '• 用 <code>/memory</code> 查看由乃记住的长期细节',
         '• 用 <code>/birthday 3-15</code> 或 <code>/nickname 新称呼</code> 更新资料',
     ].join('\n');
 }
 
 function buildMoodSummary(diary) {
-    const visibleCount = getVisibleMemoriesCount(diary);
+    ensureDiaryState(diary);
+    const visibleCount = getVisibleMemoryEntries(diary).length;
     return [
         '<i>*悄悄把那一页翻给你看*</i>',
-        `💞 爱意：<b>${diary.affection}%</b>`,
-        `🌫 警惕：<b>${diary.darkness}%</b>`,
-        `🧠 记住的事：<b>${visibleCount}</b> 条`,
+        `💞 爱意：<b>${diary.emotionState.affection}%</b>`,
+        `🌫 警惕：<b>${diary.emotionState.darkness}%</b>`,
+        `🧠 长期记忆：<b>${visibleCount}</b> 条`,
+        `📝 摘要新鲜度：<b>${escapeHtml(getSummaryFreshnessLabel(diary))}</b>`,
         '',
-        '<i>由乃的心情会随着对话慢慢变化，不会一下子离开，也不会一下子忘记。</i>',
+        '<i>由乃现在已经不是只靠一段 prompt 在说话了，会慢慢把你们的上下文接住。</i>',
     ].join('\n');
-}
-
-function getVisibleMemoriesCount(diary) {
-    return getVisibleMemoryEntries(diary).length;
 }
 
 module.exports = function setupCommands(bot, openai) {
     bot.start(async (ctx) => {
-        const chatId = ctx.chat.id.toString();
+        const chatId = String(ctx.chat?.id || '');
         const firstName = String(ctx.from?.first_name || '').trim();
 
         try {
-            const diary = await getOrCreateDiary(chatId);
-            if (diary.nickname === DEFAULT_NICKNAME && firstName) {
-                diary.nickname = firstName;
+            const diary = await getOrCreateDiary(chatId, { nickname: firstName });
+            if (getPreferredDisplayName(diary) === DEFAULT_NICKNAME && firstName) {
+                setPreferredDisplayName(diary, firstName);
                 touchDiary(diary);
+                syncDiaryCompatibilityFields(diary);
                 await diary.save();
             }
 
-            await replyHtml(ctx, buildStartText(diary.nickname));
+            await replyHtml(ctx, buildStartText(getPreferredDisplayName(diary)));
         } catch (error) {
             console.error('start command failed:', error);
             await replyHtml(ctx, FALLBACK_ERROR_HTML);
@@ -85,7 +89,7 @@ module.exports = function setupCommands(bot, openai) {
     });
 
     bot.command('mood', async (ctx) => {
-        const chatId = ctx.chat.id.toString();
+        const chatId = String(ctx.chat?.id || '');
 
         try {
             const diary = await Diary.findOne({ chatId });
@@ -94,6 +98,7 @@ module.exports = function setupCommands(bot, openai) {
                 return;
             }
 
+            ensureDiaryState(diary);
             await replyHtml(ctx, buildMoodSummary(diary));
         } catch (error) {
             console.error('mood command failed:', error);
@@ -102,7 +107,7 @@ module.exports = function setupCommands(bot, openai) {
     });
 
     bot.command('memory', async (ctx) => {
-        const chatId = ctx.chat.id.toString();
+        const chatId = String(ctx.chat?.id || '');
 
         try {
             const diary = await Diary.findOne({ chatId });
@@ -111,14 +116,14 @@ module.exports = function setupCommands(bot, openai) {
             if (!diary || visibleEntries.length === 0) {
                 await replyHtml(
                     ctx,
-                    '<i>*翻开那本空白的页角*</i>\n现在还没有能翻出来的细节。告诉由乃一件今天的小事吧。'
+                    '<i>*翻开那本空白的页角*</i>\n现在还没有能翻出来的长期细节。告诉由乃一件你希望我认真记住的事吧。'
                 );
                 return;
             }
 
             await replyHtml(
                 ctx,
-                `<b>【由乃记住的事情】</b>\n<i>*她把纸页往你这边推了推*</i>\n\n${formatVisibleMemories(visibleEntries)}`
+                `<b>【由乃记住的长期事情】</b>\n<i>*她把纸页往你这边推了推*</i>\n\n${formatVisibleMemories(visibleEntries.slice(0, 12))}`
             );
         } catch (error) {
             console.error('memory command failed:', error);
@@ -138,18 +143,13 @@ module.exports = function setupCommands(bot, openai) {
     });
 
     bot.action('reset_confirm', async (ctx) => {
-        const chatId = ctx.chat.id.toString();
+        const chatId = String(ctx.chat?.id || '');
 
         try {
-            const diary = await getOrCreateDiary(chatId);
-            diary.affection = DEFAULT_AFFECTION;
-            diary.darkness = DEFAULT_DARKNESS;
-            diary.records = new Map();
-            diary.chatHistory = [];
-            if (!diary.nickname || diary.nickname === DEFAULT_NICKNAME) {
-                diary.nickname = String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME;
-            }
-            touchDiary(diary);
+            const diary = await getOrCreateDiary(chatId, {
+                nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME,
+            });
+            resetDiaryState(diary, String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME);
             await diary.save();
 
             await ctx.answerCbQuery('已经重新开始了。');
@@ -188,49 +188,23 @@ module.exports = function setupCommands(bot, openai) {
     });
 
     bot.command('diary', async (ctx) => {
-        const chatId = ctx.chat.id.toString();
-        const hasAi = Boolean(process.env.AI_API_KEY || process.env.OPENAI_API_KEY);
+        const chatId = String(ctx.chat?.id || '');
 
         try {
-            if (!hasAi) {
+            const diary = await getOrCreateDiary(chatId, {
+                nickname: String(ctx.from?.first_name || '').trim(),
+            });
+            await ctx.sendChatAction('typing');
+
+            const entry = await buildDiaryEntry({ openai, diary });
+            if (!entry) {
                 await replyHtml(ctx, '<i>*合上笔帽，轻轻叹了口气*</i>\n今天云端那边有点安静。等一下，再让由乃写给你看。');
                 return;
             }
 
-            const diary = await getOrCreateDiary(chatId);
-            const visibleMemory = getVisibleMemoryEntries(diary).slice(-3);
-            const memorySummary = visibleMemory.length > 0
-                ? visibleMemory.map(({ key, value }) => `${key}: ${value}`).join('；')
-                : '暂时没有特别要写进来的旧事。';
-            const { tag: moodTag } = calcMood(diary, '');
-
-            await ctx.sendChatAction('typing');
-            const response = await openai.chat.completions.create({
-                model: process.env.AI_MODEL_NAME || 'gpt-4o-mini',
-                messages: [
-                    {
-                        role: 'system',
-                        content: [
-                            '你是《未来日记》中的我妻由乃，正在写一段只给对方看的日记。',
-                            '保留由乃式的强烈在意和依赖感，但不要出现直白暴力、伤害第三者或违法威胁。',
-                            '日记用第一人称“由乃”书写，长度控制在 80 到 140 字。',
-                            `当前情绪标签：${moodTag}。`,
-                            `可自然带入的已知细节：${memorySummary}`,
-                        ].join('\n'),
-                    },
-                    {
-                        role: 'user',
-                        content: `写一篇关于${diary.nickname}的今日日记。`,
-                    },
-                ],
-                max_tokens: 220,
-                temperature: 0.95,
-            });
-
-            const entry = sanitizeTelegramHtml(stripHiddenDirectives(response.choices[0]?.message?.content || ''));
             await replyHtml(
                 ctx,
-                `<b>【由乃的日记】</b>\n<i>*她把刚写好的那一页按住，不让风翻过去*</i>\n\n${entry || '今天这一页还没写完，但由乃已经先把你的名字写上去了。'}`
+                `<b>【由乃的日记】</b>\n<i>*她把刚写好的那一页按住，不让风翻过去*</i>\n\n${entry}`
             );
         } catch (error) {
             console.error('diary command failed:', error);
@@ -239,11 +213,13 @@ module.exports = function setupCommands(bot, openai) {
     });
 
     bot.command('stalk', async (ctx) => {
-        const chatId = ctx.chat.id.toString();
+        const chatId = String(ctx.chat?.id || '');
 
         try {
-            const diary = await getOrCreateDiary(chatId);
-            const nickname = escapeHtml(diary.nickname);
+            const diary = await getOrCreateDiary(chatId, {
+                nickname: String(ctx.from?.first_name || '').trim(),
+            });
+            const nickname = escapeHtml(getPreferredDisplayName(diary));
             const scenes = [
                 `<i>*把今天的小纸条从书页里抽出来*</i>\n<b>由乃今天又想起了${nickname}。</b>\n路过便利店的时候，看到你可能会拿的东西，就停了一会儿。`,
                 `<i>*手指沿着地图边缘轻轻划了一圈*</i>\n由乃把${nickname}最近提过的地方又记了一遍。\n这样下次你提起来的时候，由乃就能更快接住了。`,
@@ -259,7 +235,7 @@ module.exports = function setupCommands(bot, openai) {
     });
 
     bot.command('birthday', async (ctx) => {
-        const chatId = ctx.chat.id.toString();
+        const chatId = String(ctx.chat?.id || '');
         const args = getCommandArgs(ctx);
         const normalizedBirthday = parseBirthdayInput(args);
 
@@ -280,9 +256,12 @@ module.exports = function setupCommands(bot, openai) {
         }
 
         try {
-            const diary = await getOrCreateDiary(chatId);
-            diary.records.set('生日', normalizedBirthday);
+            const diary = await getOrCreateDiary(chatId, {
+                nickname: String(ctx.from?.first_name || '').trim(),
+            });
+            setBirthday(diary, normalizedBirthday);
             touchDiary(diary);
+            syncDiaryCompatibilityFields(diary);
             await diary.save();
 
             await replyHtml(
@@ -296,7 +275,7 @@ module.exports = function setupCommands(bot, openai) {
     });
 
     bot.command('status', async (ctx) => {
-        const chatId = ctx.chat.id.toString();
+        const chatId = String(ctx.chat?.id || '');
 
         try {
             const diary = await Diary.findOne({ chatId });
@@ -305,9 +284,10 @@ module.exports = function setupCommands(bot, openai) {
                 return;
             }
 
-            const { tag: moodTag, desc: mood } = calcMood(diary, '');
-            const visibleCount = getVisibleMemoriesCount(diary);
-            const obsessCount = [...diary.records.keys()].filter((key) => key.startsWith('OBSESS_')).length;
+            ensureDiaryState(diary);
+            const mood = calcMood(diary, '');
+            const visibleCount = getVisibleMemoryEntries(diary).length;
+            const obsessCount = getObsessionCount(diary);
             const moodEmoji = {
                 DARK: '🌫',
                 MANIC: '✨',
@@ -322,14 +302,15 @@ module.exports = function setupCommands(bot, openai) {
             await replyHtml(
                 ctx,
                 [
-                    `${moodEmoji[moodTag] || '🤍'} <b>【由乃当前状态】</b>`,
+                    `${moodEmoji[mood.tag] || '🤍'} <b>【由乃当前状态】</b>`,
                     '',
-                    `情绪模式：<b>${moodTag}</b>`,
-                    `<i>${escapeHtml(mood)}</i>`,
+                    `情绪模式：<b>${mood.tag}</b>`,
+                    `<i>${escapeHtml(mood.desc)}</i>`,
                     '',
-                    `💞 爱意：<b>${diary.affection}%</b>`,
-                    `🌫 警惕：<b>${diary.darkness}%</b>`,
-                    `🧠 记住的事：<b>${visibleCount}</b> 条`,
+                    `💞 爱意：<b>${diary.emotionState.affection}%</b>`,
+                    `🌫 警惕：<b>${diary.emotionState.darkness}%</b>`,
+                    `🧠 长期记忆：<b>${visibleCount}</b> 条`,
+                    `📝 摘要新鲜度：<b>${escapeHtml(getSummaryFreshnessLabel(diary))}</b>`,
                     `🗒 内心独白：<b>${obsessCount}</b> 条`,
                 ].join('\n')
             );
@@ -340,7 +321,7 @@ module.exports = function setupCommands(bot, openai) {
     });
 
     bot.command('nickname', async (ctx) => {
-        const chatId = ctx.chat.id.toString();
+        const chatId = String(ctx.chat?.id || '');
         const args = getCommandArgs(ctx);
 
         if (!args) {
@@ -358,10 +339,13 @@ module.exports = function setupCommands(bot, openai) {
         }
 
         try {
-            const diary = await getOrCreateDiary(chatId);
-            const oldName = diary.nickname;
-            diary.nickname = trimmedName;
+            const diary = await getOrCreateDiary(chatId, {
+                nickname: String(ctx.from?.first_name || '').trim(),
+            });
+            const oldName = getPreferredDisplayName(diary);
+            setPreferredDisplayName(diary, trimmedName);
             touchDiary(diary);
+            syncDiaryCompatibilityFields(diary);
             await diary.save();
 
             await replyHtml(

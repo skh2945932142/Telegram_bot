@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node test/utils.test.js",
+    "test": "node run-tests.js",
+    "sync:knowledge": "node scripts/sync-knowledge.js",
     "start": "node index.js",
     "dev": "nodemon index.js"
   },
