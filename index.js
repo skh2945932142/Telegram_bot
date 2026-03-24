@@ -18,6 +18,10 @@ const {
     syncDiaryCompatibilityFields,
     touchDiary,
 } = require('./src/utils');
+const {
+    shouldSendScheduledMessage,
+    buildPersonalizedScheduledMessage,
+} = require('./src/personalization');
 const setupCommands = require('./src/commands');
 const setupHandlers = require('./src/handlers');
 
@@ -170,9 +174,16 @@ async function sendScheduledMessages(slotKey, baseMessages, guardedMessages, swe
                 continue;
             }
 
+            if (!shouldSendScheduledMessage(diary, slotKey)) {
+                touchDiary(diary);
+                syncDiaryCompatibilityFields(diary);
+                await diary.save().catch((error) => console.error(`save after skip scheduled push failed [${diary.chatId}]:`, error.message));
+                continue;
+            }
+
             const pool = selectMessagePool(diary, baseMessages, guardedMessages, sweetMessages);
             const index = pickMessageIndex(diary, slotKey, pool);
-            const message = pool[index];
+            const message = buildPersonalizedScheduledMessage(diary, slotKey, pool[index]);
 
             await bot.telegram
                 .sendMessage(diary.chatId, message, { parse_mode: 'HTML' })

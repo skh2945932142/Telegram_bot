@@ -1,3 +1,5 @@
+// @ts-check
+
 const ROUTE_TYPES = {
     COMMAND: 'command',
     COLD_START: 'cold_start',

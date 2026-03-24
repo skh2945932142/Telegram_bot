@@ -1,26 +1,37 @@
-const { searchKnowledge } = require('./rag');
+// @ts-check
+
 const { ROUTE_TYPES, decideRoute } = require('./routing');
+const { searchKnowledge } = require('./rag');
+const { MAX_CHAT_HISTORY, SUMMARY_TRIGGER_TURNS } = require('./state/constants');
 const {
-    MAX_CHAT_HISTORY,
-    SUMMARY_TRIGGER_TURNS,
-    ensureDiaryState,
+    calcMood,
     applyEmotionDelta,
-    updateMoodState,
-    getVisibleMemoryEntries,
-    selectRelevantMemories,
+    buildKeyboard,
     getTimeHint,
+} = require('./state/emotion');
+const {
     sanitizeTelegramHtml,
     stripHiddenDirectives,
     stripToPlainText,
-    buildKeyboard,
+} = require('./state/text');
+const {
+    ensureDiaryState,
+    updateMoodState,
+    getVisibleMemoryEntries,
+    selectRelevantMemories,
     touchDiary,
     syncDiaryCompatibilityFields,
     upsertLongTermMemory,
     recordObsession,
     setBirthday,
-    calcMood,
     getPreferredDisplayName,
-} = require('./utils');
+    mergeUniqueStrings,
+    extractEmojiTokens,
+    getSummaryContextText,
+    buildTopicKey,
+    appendChapterSummary,
+    shouldRollChapterSummary,
+} = require('./state/diary-store');
 
 const COLD_START_TOPIC_TREE = [
     '今天最想吐槽的一件小事',
@@ -93,17 +104,17 @@ function buildUserProfileSection(diary) {
         `偏好称呼：${profile.preferredName || '未记录'}`,
         `偏好语气：${profile.preferredTone || '未记录'}`,
         `常聊话题：${(profile.topics || []).join('、') || '未记录'}`,
+        `兴趣偏好：${(profile.interests || []).join('、') || '未记录'}`,
+        `常用表情：${(profile.commonEmoji || []).join(' ') || '未记录'}`,
+        `问候风格：${profile.greetingStyle || '未记录'}`,
+        `推送偏好：${profile.pushPreference || '未记录'}`,
         `明确边界：${(profile.boundaries || []).join('、') || '未记录'}`,
         `生日：${profile.birthday || '未记录'}`,
     ].join('\n');
 }
 
 function buildThreadSummarySection(diary) {
-    if (!diary.session?.threadSummary) {
-        return '暂无线程摘要。';
-    }
-
-    return diary.session.threadSummary;
+    return getSummaryContextText(diary);
 }
 
 function buildRecentTurnsSection(turns) {
@@ -133,7 +144,11 @@ function buildKnowledgeSection(chunks) {
     }
 
     return chunks
-        .map((chunk, index) => `${index + 1}. [${chunk.sourceType}] ${chunk.text}`)
+        .map((chunk, index) => {
+            const sourceLabel = chunk.isRemote ? 'remote' : chunk.sourceType;
+            const extra = chunk.sourceUrl ? ` (${chunk.sourceUrl})` : '';
+            return `${index + 1}. [${sourceLabel}] ${chunk.text}${extra}`;
+        })
         .join('\n');
 }
 
@@ -155,6 +170,7 @@ function buildRouteGuidance(routeDecision) {
         ],
         [ROUTE_TYPES.KNOWLEDGE_QA]: [
             '优先基于知识片段回答，事实要稳，不知道就直接说不知道，不要编造。',
+            '若命中远程网页片段，优先综合多个片段，避免照抄网页。',
             '保持简洁清楚，知识准确度高于风格浓度。',
         ],
         [ROUTE_TYPES.EMOTION_SUPPORT]: [
@@ -261,11 +277,11 @@ async function generateDraftReply({ openai, routeDecision, context, normalizedMe
     }
 
     const config = {
-        [ROUTE_TYPES.KNOWLEDGE_QA]: { temperature: 0.45, max_tokens: 260 },
+        [ROUTE_TYPES.KNOWLEDGE_QA]: { temperature: 0.42, max_tokens: 320 },
         [ROUTE_TYPES.EMOTION_SUPPORT]: { temperature: 0.82, max_tokens: 320 },
         [ROUTE_TYPES.COLD_START]: { temperature: 0.88, max_tokens: 320 },
         [ROUTE_TYPES.FOLLOW_UP]: { temperature: 0.8, max_tokens: 280 },
-        [ROUTE_TYPES.MEMORY_UPDATE_ONLY]: { temperature: 0.78, max_tokens: 280 },
+        [ROUTE_TYPES.MEMORY_UPDATE_ONLY]: { temperature: 0.76, max_tokens: 280 },
         [ROUTE_TYPES.GENERAL_CHAT]: { temperature: 0.86, max_tokens: 300 },
     }[routeDecision.type] || { temperature: 0.82, max_tokens: 300 };
 
@@ -300,16 +316,19 @@ async function rewriteStyleReply({ openai, routeDecision, draftText, diary, mood
         return sanitizeTelegramHtml(cleanDraft);
     }
 
+    const profile = diary.profile || {};
     const response = await openai.chat.completions.create({
         model: getChatModelName(true),
         messages: [
             {
                 role: 'system',
                 content: [
-                    `你是由乃的风格层，只负责把草稿改写成 Telegram 私聊里更像由乃的说法。`,
-                    `保留原意，不要新增事实，不要改变结论。`,
+                    '你是由乃的风格层，只负责把草稿改写成 Telegram 私聊里更像由乃的说法。',
+                    '保留原意，不要新增事实，不要改变结论。',
                     `当前情绪模式：${mood.tag}。`,
                     `称呼用户时优先使用：${getPreferredDisplayName(diary)}。`,
+                    `用户偏好语气：${profile.preferredTone || '未记录'}。`,
+                    `用户常用表情：${(profile.commonEmoji || []).join(' ') || '未记录'}。`,
                     '输出 3 到 4 句中文，可以使用 <i>*动作*</i> 和 <b>重点</b>，但不要全篇都加粗。',
                     '不要输出 SAVE_MEMORY、YUNO_OBSESS 或 JSON。',
                 ].join('\n'),
@@ -350,6 +369,10 @@ function extractStableMemoriesHeuristically(text) {
             birthday: '',
             topics: [],
             boundaries: [],
+            interests: [],
+            commonEmoji: extractEmojiTokens(source),
+            greetingStyle: '',
+            pushPreference: '',
         },
         memories: [],
     };
@@ -386,9 +409,11 @@ function extractStableMemoriesHeuristically(text) {
         pushMemory('profile', '资料_生日', birthday[1], 0.95);
     }
 
-    const likes = source.match(/我喜欢([^，。！？?]{1,24})/u);
+    const likes = source.match(/(?:我喜欢|我爱看|我常玩|我最近在追)([^，。！？?]{1,24})/u);
     if (likes) {
+        result.profileUpdates.interests.push(likes[1].trim());
         pushMemory('preference', '偏好_喜好', likes[1], 0.72);
+        pushMemory('topic', '话题_兴趣', likes[1], 0.68);
     }
 
     const dislikes = source.match(/(?:我不喜欢|我讨厌)([^，。！？?]{1,24})/u);
@@ -401,6 +426,24 @@ function extractStableMemoriesHeuristically(text) {
     if (topics) {
         result.profileUpdates.topics.push(topics[1].trim());
         pushMemory('topic', '话题_常聊', topics[1], 0.68);
+    }
+
+    const tone = source.match(/(?:说话|语气)(?:可以|希望|最好)?(温柔一点|直接一点|短一点|可爱一点|少一点表情|别太黏)/u);
+    if (tone) {
+        result.profileUpdates.preferredTone = tone[1].trim();
+        pushMemory('preference', '偏好_语气', tone[1], 0.84);
+    }
+
+    const greeting = source.match(/(?:早上|早安|打招呼)(?:可以|希望|最好)?(简短一点|活泼一点|温柔一点|直接一点|像叫我起床一样)/u);
+    if (greeting) {
+        result.profileUpdates.greetingStyle = greeting[1].trim();
+        pushMemory('preference', '偏好_问候', greeting[1], 0.8);
+    }
+
+    const pushPreference = source.match(/(?:你可以|提醒我|消息)(?:多一点|主动一点|少一点|别太频繁|安静一点)/u);
+    if (pushPreference) {
+        result.profileUpdates.pushPreference = pushPreference[0].replace(/^.*?(多一点|主动一点|少一点|别太频繁|安静一点).*$/u, '$1');
+        pushMemory('preference', '偏好_推送', result.profileUpdates.pushPreference, 0.76);
     }
 
     const roleplay = source.match(/(?:记住这个设定|角色设定[:：]|设定里)([^。！？\n]{1,40})/u);
@@ -431,9 +474,9 @@ async function extractStableMemories({ openai, normalizedMessage, routeDecision 
                     role: 'system',
                     content: [
                         '你是一个记忆抽取器，只提取适合长期保存的稳定用户信息。',
-                        '只保留这些类型：称呼偏好、语气偏好、喜欢/不喜欢、常聊话题、长期设定、重要生活事件、生日。',
+                        '只保留这些类型：称呼偏好、语气偏好、喜欢/不喜欢、常聊话题、兴趣、长期设定、重要生活事件、生日、常用表情、问候偏好、推送偏好。',
                         '不要记录一时情绪、普通寒暄、当前一句抱怨。',
-                        '输出严格 JSON，结构为 {"profileUpdates":{"preferredName":"","preferredTone":"","birthday":"","topics":[],"boundaries":[]},"memories":[{"category":"","key":"","value":"","weight":0.7}]}。',
+                        '输出严格 JSON，结构为 {"profileUpdates":{"preferredName":"","preferredTone":"","birthday":"","topics":[],"boundaries":[],"interests":[],"commonEmoji":[],"greetingStyle":"","pushPreference":""},"memories":[{"category":"","key":"","value":"","weight":0.7}]}。',
                     ].join('\n'),
                 },
                 {
@@ -441,7 +484,7 @@ async function extractStableMemories({ openai, normalizedMessage, routeDecision 
                     content: normalizedMessage.text,
                 },
             ],
-            max_tokens: 280,
+            max_tokens: 320,
             temperature: 0.1,
         });
 
@@ -456,10 +499,14 @@ async function extractStableMemories({ openai, normalizedMessage, routeDecision 
         return {
             profileUpdates: {
                 preferredName: stripToPlainText(profileUpdates.preferredName || heuristic.profileUpdates.preferredName),
-                preferredTone: stripToPlainText(profileUpdates.preferredTone || ''),
+                preferredTone: stripToPlainText(profileUpdates.preferredTone || heuristic.profileUpdates.preferredTone),
                 birthday: stripToPlainText(profileUpdates.birthday || heuristic.profileUpdates.birthday),
                 topics: Array.isArray(profileUpdates.topics) ? profileUpdates.topics.map(stripToPlainText).filter(Boolean) : heuristic.profileUpdates.topics,
                 boundaries: Array.isArray(profileUpdates.boundaries) ? profileUpdates.boundaries.map(stripToPlainText).filter(Boolean) : heuristic.profileUpdates.boundaries,
+                interests: Array.isArray(profileUpdates.interests) ? profileUpdates.interests.map(stripToPlainText).filter(Boolean) : heuristic.profileUpdates.interests,
+                commonEmoji: Array.isArray(profileUpdates.commonEmoji) ? profileUpdates.commonEmoji.map(stripToPlainText).filter(Boolean) : heuristic.profileUpdates.commonEmoji,
+                greetingStyle: stripToPlainText(profileUpdates.greetingStyle || heuristic.profileUpdates.greetingStyle),
+                pushPreference: stripToPlainText(profileUpdates.pushPreference || heuristic.profileUpdates.pushPreference),
             },
             memories: [
                 ...heuristic.memories,
@@ -480,43 +527,35 @@ async function extractStableMemories({ openai, normalizedMessage, routeDecision 
     }
 }
 
-function mergeUniqueStrings(values, additions, limit = 8) {
-    const merged = new Set((values || []).map((value) => String(value)));
-    for (const item of additions || []) {
-        const text = stripToPlainText(item);
-        if (!text) {
-            continue;
-        }
-        merged.add(text);
-        if (merged.size >= limit) {
-            break;
-        }
-    }
-    return [...merged].slice(0, limit);
-}
-
 function applyExtractedMemories(diary, extracted) {
     if (!extracted) {
         return;
     }
 
     const profile = diary.profile || {};
-    const profileUpdates = extracted.profileUpdates || {};
+    const updates = extracted.profileUpdates || {};
 
-    if (profileUpdates.preferredName) {
-        profile.preferredName = profileUpdates.preferredName;
+    if (updates.preferredName) {
+        profile.preferredName = updates.preferredName;
+    }
+    if (updates.preferredTone) {
+        profile.preferredTone = updates.preferredTone;
+    }
+    if (updates.birthday) {
+        setBirthday(diary, updates.birthday);
     }
 
-    if (profileUpdates.preferredTone) {
-        profile.preferredTone = profileUpdates.preferredTone;
+    profile.topics = mergeUniqueStrings(profile.topics, updates.topics);
+    profile.boundaries = mergeUniqueStrings(profile.boundaries, updates.boundaries);
+    profile.interests = mergeUniqueStrings(profile.interests, updates.interests);
+    profile.commonEmoji = mergeUniqueStrings(profile.commonEmoji, updates.commonEmoji, 4);
+    if (updates.greetingStyle) {
+        profile.greetingStyle = updates.greetingStyle;
+    }
+    if (updates.pushPreference) {
+        profile.pushPreference = updates.pushPreference;
     }
 
-    if (profileUpdates.birthday) {
-        setBirthday(diary, profileUpdates.birthday);
-    }
-
-    profile.topics = mergeUniqueStrings(profile.topics, profileUpdates.topics);
-    profile.boundaries = mergeUniqueStrings(profile.boundaries, profileUpdates.boundaries);
     diary.profile = profile;
     diary.markModified('profile');
 
@@ -533,18 +572,21 @@ function buildThreadSummaryFallback({ diary, normalizedMessage, assistantText, m
     const memoryHighlights = getVisibleMemoryEntries(diary)
         .slice(0, 2)
         .map((entry) => `${entry.key}:${entry.value}`);
+    const chapterHighlights = (diary.session?.chapterSummaries || [])
+        .slice(-2)
+        .map((chapter) => chapter.summary);
+
     const summary = [
+        chapterHighlights.length > 0 ? `旧章节：${chapterHighlights.join('；')}` : '',
         diary.session?.threadSummary ? `已有摘要：${diary.session.threadSummary}` : '',
         `最新用户输入：${normalizedMessage.text}`,
         recentUserTurns.length > 0 ? `近期话题：${recentUserTurns.join('；')}` : '',
         memoryHighlights.length > 0 ? `稳定信息：${memoryHighlights.join('；')}` : '',
         `当前情绪模式：${mood.tag}，重点是继续承接用户正在谈的话题。`,
         assistantText ? `刚刚的回复方向：${stripToPlainText(assistantText).slice(0, 60)}` : '',
-    ]
-        .filter(Boolean)
-        .join(' ');
+    ].filter(Boolean).join(' ');
 
-    return summary.slice(0, 240);
+    return summary.slice(0, 260);
 }
 
 async function refreshThreadSummary({ openai, diary, normalizedMessage, assistantText, mood }) {
@@ -556,6 +598,10 @@ async function refreshThreadSummary({ openai, diary, normalizedMessage, assistan
         .slice(-MAX_CHAT_HISTORY)
         .map((turn) => `${turn.role === 'assistant' ? '由乃' : '用户'}：${turn.content}`)
         .join('\n');
+    const chapterContext = (diary.session?.chapterSummaries || [])
+        .slice(-2)
+        .map((chapter, index) => `章节摘要${index + 1}：${chapter.summary}`)
+        .join('\n');
 
     try {
         const response = await openai.chat.completions.create({
@@ -565,14 +611,16 @@ async function refreshThreadSummary({ openai, diary, normalizedMessage, assistan
                     role: 'system',
                     content: [
                         '你是线程摘要器。',
-                        '把对话概括成 180 到 260 个中文字符，只保留事实、关系变化、未完成话题和当前情绪。',
+                        '把当前对话概括成 180 到 260 个中文字符，只保留事实、关系变化、未完成话题和当前情绪。',
+                        '如果给了旧章节摘要，只把它们当背景，不要重复展开。',
                         '不要写文风修辞，不要使用 HTML，不要写成对话。',
                     ].join('\n'),
                 },
                 {
                     role: 'user',
                     content: [
-                        diary.session?.threadSummary ? `已有摘要：${diary.session.threadSummary}` : '暂无已有摘要。',
+                        chapterContext ? `旧章节背景：\n${chapterContext}` : '',
+                        diary.session?.threadSummary ? `当前线程旧摘要：${diary.session.threadSummary}` : '暂无当前线程旧摘要。',
                         `最近消息：\n${recentTranscript}`,
                         `最新用户输入：${normalizedMessage.text}`,
                         assistantText ? `刚回复给用户的话：${stripToPlainText(assistantText)}` : '',
@@ -614,7 +662,7 @@ async function persistConversationState({ openai, diary, normalizedMessage, assi
     const userTurn = {
         role: 'user',
         content: stripToPlainText(normalizedMessage.text),
-        timestamp: new Date(normalizedMessage.timestamp * 1000),
+        timestamp: new Date((normalizedMessage.timestamp || Math.floor(Date.now() / 1000)) * 1000),
     };
     const assistantTurn = {
         role: 'assistant',
@@ -631,21 +679,48 @@ async function persistConversationState({ openai, diary, normalizedMessage, assi
     diary.session.recentTurns = nextTurns.slice(-MAX_CHAT_HISTORY);
     diary.session.turnsSinceSummary = Number(diary.session?.turnsSinceSummary || 0) + 1;
 
-    if (nextTurns.length > MAX_CHAT_HISTORY || diary.session.turnsSinceSummary >= SUMMARY_TRIGGER_TURNS) {
-        diary.session.threadSummary = await refreshThreadSummary({
+    const nextTopicKey = buildTopicKey([
+        normalizedMessage.text,
+        ...nextTurns.filter((turn) => turn.role === 'user').slice(-2).map((turn) => turn.content),
+    ].join(' '));
+
+    let rolledChapterSummary = false;
+    if (shouldRollChapterSummary(diary, nextTopicKey)) {
+        appendChapterSummary(diary, diary.session.threadSummary);
+        diary.session.threadSummary = '';
+        rolledChapterSummary = true;
+    }
+
+    if (rolledChapterSummary || nextTurns.length > MAX_CHAT_HISTORY || diary.session.turnsSinceSummary >= SUMMARY_TRIGGER_TURNS) {
+        const refreshedSummary = await refreshThreadSummary({
             openai,
             diary,
             normalizedMessage,
             assistantText,
             mood,
         });
+        diary.session.threadSummary = refreshedSummary || buildThreadSummaryFallback({
+            diary,
+            normalizedMessage,
+            assistantText,
+            mood,
+        });
         diary.session.turnsSinceSummary = 0;
+        diary.session.summaryVersion = Number(diary.session.summaryVersion || 1) + 1;
     }
+
+    diary.session.lastTopicKey = nextTopicKey;
 
     const extracted = routeDecision.shouldExtractMemory
         ? await extractStableMemories({ openai, normalizedMessage, routeDecision })
         : null;
     applyExtractedMemories(diary, extracted);
+
+    const inferredEmoji = extractEmojiTokens(normalizedMessage.text);
+    if (inferredEmoji.length > 0) {
+        diary.profile.commonEmoji = mergeUniqueStrings(diary.profile.commonEmoji, inferredEmoji, 4);
+        diary.markModified('profile');
+    }
 
     const obsession = buildObsessionNote({ diary, normalizedMessage, routeDecision, mood });
     if (obsession) {
@@ -654,6 +729,14 @@ async function persistConversationState({ openai, diary, normalizedMessage, assi
 
     touchDiary(diary);
     syncDiaryCompatibilityFields(diary);
+    if (!diary.session.threadSummary && diary.session.recentTurns.length > 0) {
+        diary.session.threadSummary = buildThreadSummaryFallback({
+            diary,
+            normalizedMessage,
+            assistantText,
+            mood,
+        });
+    }
     await diary.save();
 }
 
@@ -670,9 +753,11 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
     const knowledgeChunks = routeDecision.shouldSearchKnowledge
         ? await searchKnowledge({
             openai,
-            query: normalizedMessage.text,
+            diary,
+            normalizedMessage,
+            routeDecision,
             platformScope: 'telegram_private',
-            limit: 3,
+            limit: 4,
         })
         : [];
     const context = buildConversationContext({
@@ -730,14 +815,15 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
 
 async function buildDiaryEntry({ openai, diary }) {
     ensureDiaryState(diary);
-
     if (!hasAiClient(openai)) {
         return '';
     }
 
     const mood = calcMood(diary, '');
-    const memories = getVisibleMemoryEntries(diary).slice(0, 3);
-    const summary = diary.session?.threadSummary || '暂无线程摘要。';
+    const memories = getVisibleMemoryEntries(diary).slice(0, 4);
+    const summary = getSummaryContextText(diary);
+    const profile = diary.profile || {};
+
     const response = await openai.chat.completions.create({
         model: getChatModelName(false),
         messages: [
@@ -748,7 +834,8 @@ async function buildDiaryEntry({ openai, diary }) {
                     '长度控制在 80 到 140 个中文字符。',
                     '可以保留由乃的人设气质，但不要输出暴力、威胁或说教。',
                     `当前情绪：${mood.tag} ${mood.desc}`,
-                    `线程摘要：${summary}`,
+                    `上下文摘要：${summary}`,
+                    `兴趣偏好：${(profile.interests || []).join('、') || '未记录'}`,
                     memories.length > 0
                         ? `可以自然带入的稳定信息：${memories.map((memory) => `${memory.key}:${memory.value}`).join('；')}`
                         : '暂时没有要特别带入的稳定信息。',

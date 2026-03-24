@@ -10,8 +10,17 @@ const {
     extractStableMemoriesHeuristically,
     persistConversationState,
 } = require('./src/orchestrator');
-const { searchKnowledge } = require('./src/rag');
+const {
+    buildRetrievalQuery,
+    loadKnowledgeCorpus,
+    rerankKnowledgeChunks,
+    searchKnowledge,
+} = require('./src/rag');
 const { ensureDiaryState } = require('./src/utils');
+const {
+    buildPersonalizedScheduledMessage,
+    shouldSendScheduledMessage,
+} = require('./src/personalization');
 
 let failures = 0;
 
@@ -91,6 +100,10 @@ async function main() {
                 preferredTone: '更轻一点',
                 topics: ['技术', '动画'],
                 boundaries: ['不喜欢被叫宝宝'],
+                interests: ['抹茶拿铁', '动画'],
+                commonEmoji: ['✨', '🤍'],
+                greetingStyle: '温柔一点',
+                pushPreference: '主动一点',
                 birthday: '3-15',
             },
             longTermMemories: [
@@ -123,6 +136,9 @@ async function main() {
             '当前用户输入',
         ]);
         assert.match(context.systemPrompt, /### 系统人格设定[\s\S]*### 平台上下文[\s\S]*### 用户画像/);
+        assert.match(context.systemPrompt, /兴趣偏好：抹茶拿铁、动画/);
+        assert.match(context.systemPrompt, /常用表情：✨ 🤍/);
+        assert.match(context.systemPrompt, /问候风格：温柔一点/);
     });
 
     await runTest('persistConversationState refreshes summary and keeps only the latest eight turns', async () => {
@@ -185,7 +201,20 @@ async function main() {
     await runTest('searchKnowledge falls back to local corpus without qdrant', async () => {
         const results = await searchKnowledge({
             openai: null,
-            query: '你们现在是怎么组织上下文的',
+            diary: createDiary({
+                session: {
+                    recentTurns: [
+                        { role: 'user', content: '你会记住什么', timestamp: new Date() },
+                    ],
+                    threadSummary: '你们刚聊过 bot 的记忆和上下文组织方式。',
+                },
+            }),
+            normalizedMessage: {
+                text: '你们现在是怎么组织上下文的',
+            },
+            routeDecision: {
+                type: 'knowledge_qa',
+            },
             platformScope: 'telegram_private',
             limit: 3,
         });
@@ -194,7 +223,195 @@ async function main() {
         assert.ok(results.some((chunk) => ['persona', 'rules', 'faq'].includes(chunk.sourceType)));
     });
 
-    if (failures > 0 || process.exitCode > 0) {
+    await runTest('loadKnowledgeCorpus loads expanded seed metadata', async () => {
+        const corpus = loadKnowledgeCorpus();
+
+        assert.ok(corpus.length >= 20);
+        assert.ok(corpus.some((chunk) => chunk.sourceType === 'feature'));
+        assert.ok(corpus.some((chunk) => chunk.sourceType === 'notice'));
+        assert.ok(corpus.some((chunk) => Array.isArray(chunk.tags) && chunk.tags.length > 0));
+    });
+
+    await runTest('buildRetrievalQuery combines input, summary, recent user turns and route type', async () => {
+        const diary = createDiary();
+        diary.session.threadSummary = '你们在讨论 bot 的长期记忆和检索。';
+        diary.session.recentTurns = [
+            { role: 'user', content: '它会联网吗', timestamp: new Date() },
+            { role: 'assistant', content: '必要时会补远程网页。', timestamp: new Date() },
+            { role: 'user', content: '那长期记忆存在哪里', timestamp: new Date() },
+        ];
+
+        const query = buildRetrievalQuery({
+            diary,
+            normalizedMessage: { text: '所以 Qdrant 是拿来干什么的' },
+            routeDecision: { type: 'knowledge_qa' },
+        });
+
+        assert.match(query, /Qdrant/);
+        assert.match(query, /长期记忆/);
+        assert.match(query, /route:knowledge_qa/);
+    });
+
+    await runTest('rerankKnowledgeChunks applies mmr-style dedupe and dialogue cap', async () => {
+        const ranked = rerankKnowledgeChunks([
+            { id: 'a', text: '记忆机制会记录稳定偏好和生日。', sourceType: 'faq', score: 20 },
+            { id: 'b', text: '记忆机制会记录稳定偏好和生日。', sourceType: 'faq', score: 19 },
+            { id: 'c', text: '冷启动时可以给一个二选一问题。', sourceType: 'dialogue', score: 18 },
+            { id: 'd', text: '冷启动时可以给一个轻量互动题。', sourceType: 'dialogue', score: 17.5 },
+            { id: 'e', text: 'Qdrant 只负责知识检索，不存长期记忆。', sourceType: 'faq', score: 18.5 },
+        ], 'Qdrant 长期记忆 冷启动', 4);
+
+        assert.ok(ranked.length <= 4);
+        assert.ok(ranked.filter((chunk) => chunk.sourceType === 'dialogue').length <= 1);
+        assert.ok(ranked.some((chunk) => chunk.id === 'a'));
+        assert.ok(!ranked.every((chunk) => ['a', 'b'].includes(chunk.id)));
+    });
+
+    await runTest('knowledge search supplements with remote documents when local confidence is low', async () => {
+        const oldSearchApiUrl = process.env.SEARCH_API_URL;
+        const oldLocalThreshold = process.env.LOCAL_LOW_SCORE_THRESHOLD;
+        const originalFetch = global.fetch;
+
+        process.env.SEARCH_API_URL = 'https://example.test/search?q={query}';
+        process.env.LOCAL_LOW_SCORE_THRESHOLD = '999';
+
+        /** @type {typeof global.fetch} */
+        const mockedFetch = async (url) => {
+            if (String(url).startsWith('https://example.test/search')) {
+                return /** @type {Response} */ ({
+                    ok: true,
+                    async json() {
+                        return {
+                            results: [
+                                {
+                                    url: 'https://docs.example.test/bot-memory',
+                                    title: 'Bot Memory',
+                                    snippet: 'bot memory and remote search',
+                                },
+                            ],
+                        };
+                    },
+                });
+            }
+
+            return /** @type {Response} */ ({
+                ok: true,
+                async text() {
+                    return '<html><head><title>Memory Doc</title></head><body>Qdrant 只负责知识检索，用户长期记忆仍保存在 Mongo。远程网页内容只参与当前一轮回答。</body></html>';
+                },
+            });
+        };
+        global.fetch = mockedFetch;
+
+        try {
+            const results = await searchKnowledge({
+                openai: null,
+                diary: createDiary(),
+                normalizedMessage: {
+                    text: 'Qdrant 和长期记忆分别负责什么',
+                },
+                routeDecision: {
+                    type: 'knowledge_qa',
+                },
+                platformScope: 'telegram_private',
+                limit: 4,
+            });
+
+            assert.ok(results.some((chunk) => chunk.isRemote));
+            assert.ok(results.some((chunk) => /长期记忆/.test(chunk.text)));
+        } finally {
+            global.fetch = originalFetch;
+            if (oldSearchApiUrl === undefined) {
+                delete process.env.SEARCH_API_URL;
+            } else {
+                process.env.SEARCH_API_URL = oldSearchApiUrl;
+            }
+            if (oldLocalThreshold === undefined) {
+                delete process.env.LOCAL_LOW_SCORE_THRESHOLD;
+            } else {
+                process.env.LOCAL_LOW_SCORE_THRESHOLD = oldLocalThreshold;
+            }
+        }
+    });
+
+    await runTest('personalized scheduled messages use profile interests, emoji and push preference', async () => {
+        const diary = createDiary({
+            profile: {
+                nickname: '阿澈',
+                preferredName: '阿澈',
+                preferredTone: '',
+                topics: [],
+                boundaries: [],
+                interests: ['抹茶拿铁'],
+                commonEmoji: ['✨'],
+                greetingStyle: '像叫我起床一样',
+                pushPreference: '主动一点',
+                birthday: '',
+            },
+        });
+
+        const morning = buildPersonalizedScheduledMessage(diary, 'morning', '早上好。');
+        assert.match(morning, /阿澈/);
+        assert.match(morning, /别赖床太久/);
+        assert.match(morning, /✨/);
+
+        diary.profile.pushPreference = '别太频繁';
+        assert.equal(shouldSendScheduledMessage(diary, 'afternoon'), false);
+    });
+
+    await runTest('persistConversationState rolls long summaries into chapter summaries on topic shift', async () => {
+        const diary = createDiary();
+        diary.session.threadSummary = '你们已经围绕抹茶拿铁和动画聊了很久。'.repeat(14);
+        diary.session.lastTopicKey = '抹茶|动画';
+        diary.session.summaryVersion = 1;
+        diary.session.recentTurns = [
+            { role: 'user', content: '我最近老在看动画', timestamp: new Date() },
+            { role: 'assistant', content: '你前面也提过这个。', timestamp: new Date() },
+        ];
+
+        await persistConversationState({
+            openai: null,
+            diary,
+            normalizedMessage: {
+                text: '今天想问 Qdrant 和 Mongo 的区别。',
+                timestamp: 1710000300,
+            },
+            assistantText: 'Qdrant 负责检索，Mongo 负责你的结构化记忆。',
+            routeDecision: { type: 'knowledge_qa', shouldExtractMemory: true },
+            mood: { tag: 'NORMAL', desc: '状态平稳。' },
+        });
+
+        assert.ok(diary.session.chapterSummaries.length >= 1);
+        assert.ok(Number(diary.session.summaryVersion) >= 2);
+        assert.ok(diary.session.threadSummary.length > 0);
+    });
+
+    await runTest('ensureDiaryState migrates legacy records and chat history into structured state', async () => {
+        const legacyDiary = createDiary({
+            profile: null,
+            emotionState: null,
+            session: null,
+            longTermMemories: [],
+            nickname: '旧昵称',
+            records: new Map([
+                ['生日', '3-15'],
+                ['偏好_饮料', '抹茶拿铁'],
+            ]),
+            chatHistory: [
+                { role: 'user', content: '旧消息 1' },
+                { role: 'assistant', content: '旧消息 2' },
+            ],
+        });
+
+        ensureDiaryState(legacyDiary);
+
+        assert.equal(legacyDiary.profile.birthday, '3-15');
+        assert.ok(legacyDiary.longTermMemories.some((memory) => memory.key === '偏好_饮料'));
+        assert.equal(legacyDiary.session.recentTurns.length, 2);
+        assert.equal(legacyDiary.profile.nickname, '旧昵称');
+    });
+
+    if (failures > 0 || Number(process.exitCode || 0) > 0) {
         process.exitCode = 1;
     } else {
         console.log('Extended tests passed.');
