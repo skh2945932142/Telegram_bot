@@ -101,7 +101,6 @@ const diarySchema = new mongoose.Schema(
         chatId: { type: String, required: true, unique: true },
         affection: { type: Number, default: DEFAULT_AFFECTION },
         darkness: { type: Number, default: DEFAULT_DARKNESS },
-        records: { type: Map, of: String, default: {} },
         chatHistory: { type: Array, default: [] },
         lastActiveAt: { type: Date, default: Date.now },
         nickname: { type: String, default: DEFAULT_NICKNAME },
@@ -115,6 +114,20 @@ const diarySchema = new mongoose.Schema(
 );
 
 const Diary = mongoose.models.Diary || mongoose.model('Diary', diarySchema);
+
+const NORMALIZED = Symbol('normalized');
+
+/** @type {Map<string, any>} */
+const diaryCache = new Map();
+
+/**
+ * Clear the normalized flag so the next ensureDiaryState call re-runs.
+ * Call this after any mutation that changes state structure.
+ * @param {any} diary
+ */
+function invalidateNormalized(diary) {
+    diary[NORMALIZED] = false;
+}
 
 /**
  * @param {string[]} values
@@ -425,7 +438,6 @@ function syncDiaryCompatibilityFields(diary) {
     diary.emotionState = emotionState;
     diary.session = session;
     diary.legacyRecords = legacyRecords;
-    diary.records = createMapFromEntries(getMapEntries(legacyRecords));
     diary.nickname = profile.nickname || DEFAULT_NICKNAME;
     diary.affection = clamp(Number(emotionState.affection ?? diary.affection), 0, 100);
     diary.darkness = clamp(Number(emotionState.darkness ?? diary.darkness), 0, 100);
@@ -440,6 +452,9 @@ function syncDiaryCompatibilityFields(diary) {
  * @param {any} diary
  */
 function ensureDiaryState(diary) {
+    if (diary[NORMALIZED]) {
+        return diary;
+    }
     let changed = false;
 
     if (!diary.profile) {
@@ -549,6 +564,7 @@ function ensureDiaryState(diary) {
         diary.markModified('legacyRecords');
     }
 
+    diary[NORMALIZED] = true;
     return diary;
 }
 
@@ -557,6 +573,12 @@ function ensureDiaryState(diary) {
  * @param {Record<string, any>} [seed]
  */
 async function getOrCreateDiary(chatId, seed = {}) {
+    if (diaryCache.has(chatId)) {
+        const cached = diaryCache.get(chatId);
+        ensureDiaryState(cached);
+        return cached;
+    }
+
     let diary = await Diary.findOne({ chatId });
     if (!diary) {
         diary = new Diary({
@@ -569,6 +591,7 @@ async function getOrCreateDiary(chatId, seed = {}) {
     }
 
     ensureDiaryState(diary);
+    diaryCache.set(chatId, diary);
     return diary;
 }
 
@@ -588,6 +611,7 @@ function trimChatHistory(history) {
  */
 function appendRecentTurn(diary, turn) {
     ensureDiaryState(diary);
+    invalidateNormalized(diary);
     const nextTurn = normalizeTurn(turn);
     if (!nextTurn) {
         return;
@@ -599,7 +623,6 @@ function appendRecentTurn(diary, turn) {
     ]);
     diary.session.lastMessageAt = nextTurn.timestamp;
     diary.markModified('session');
-    syncDiaryCompatibilityFields(diary);
 }
 
 /**
@@ -705,6 +728,7 @@ function selectRelevantMemories(entries, userMessage, limit = RELEVANT_MEMORY_LI
  */
 function upsertLongTermMemory(diary, memory) {
     ensureDiaryState(diary);
+    invalidateNormalized(diary);
     const nextMemory = normalizeMemory(memory);
     if (!nextMemory) {
         return null;
@@ -747,7 +771,6 @@ function upsertLongTermMemory(diary, memory) {
     }
 
     diary.markModified('longTermMemories');
-    syncDiaryCompatibilityFields(diary);
     return nextMemory;
 }
 
@@ -786,8 +809,6 @@ function applyMemoryUpdates(diary, directives) {
     for (const obsession of directives.obsessions || []) {
         recordObsession(diary, obsession);
     }
-
-    syncDiaryCompatibilityFields(diary);
 }
 
 /**
@@ -809,7 +830,6 @@ function recordObsession(diary, obsession) {
 
     diary.legacyRecords = legacyRecords;
     diary.markModified('legacyRecords');
-    syncDiaryCompatibilityFields(diary);
 }
 
 /**
@@ -825,12 +845,12 @@ function getObsessionCount(diary) {
  */
 function updateMoodState(diary, userMessage = '') {
     ensureDiaryState(diary);
+    invalidateNormalized(diary);
     const mood = calcMood(diary, userMessage);
     diary.emotionState.moodTag = mood.tag;
     diary.emotionState.moodDesc = mood.desc;
     diary.emotionState.updatedAt = new Date();
     diary.markModified('emotionState');
-    syncDiaryCompatibilityFields(diary);
     return mood;
 }
 
@@ -887,6 +907,7 @@ function getPreferredDisplayName(diary) {
  */
 function setPreferredDisplayName(diary, nickname) {
     ensureDiaryState(diary);
+    invalidateNormalized(diary);
     const safeName = stripToPlainText(nickname).slice(0, 20);
     if (!safeName) {
         return;
@@ -894,7 +915,6 @@ function setPreferredDisplayName(diary, nickname) {
     diary.profile.nickname = safeName;
     diary.nickname = safeName;
     diary.markModified('profile');
-    syncDiaryCompatibilityFields(diary);
 }
 
 /**
@@ -903,10 +923,10 @@ function setPreferredDisplayName(diary, nickname) {
  */
 function setBirthday(diary, birthday) {
     ensureDiaryState(diary);
+    invalidateNormalized(diary);
     diary.profile.birthday = birthday;
     diary.markModified('profile');
     setLegacyRecord(diary, '生日', birthday);
-    syncDiaryCompatibilityFields(diary);
 }
 
 /**
@@ -1037,7 +1057,6 @@ function resetDiaryState(diary, nicknameSeed = DEFAULT_NICKNAME) {
     diary.session = createDefaultSession();
     diary.longTermMemories = [];
     diary.legacyRecords = new Map();
-    diary.records = new Map();
     diary.chatHistory = [];
     diary.nickname = nicknameSeed;
     diary.affection = DEFAULT_AFFECTION;
@@ -1048,6 +1067,7 @@ function resetDiaryState(diary, nicknameSeed = DEFAULT_NICKNAME) {
 
 module.exports = {
     Diary,
+    invalidateNormalized,
     createDefaultProfile,
     createDefaultEmotionState,
     createDefaultSession,

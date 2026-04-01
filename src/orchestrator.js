@@ -21,6 +21,7 @@ const {
     selectRelevantMemories,
     touchDiary,
     syncDiaryCompatibilityFields,
+    invalidateNormalized,
     upsertLongTermMemory,
     recordObsession,
     setBirthday,
@@ -193,6 +194,19 @@ function buildRouteGuidance(routeDecision) {
     return [...common, ...routeSpecific].join('\n');
 }
 
+function buildStyleSection({ diary, mood }) {
+    const profile = diary.profile || {};
+    return [
+        '输出格式（直接生成最终回复，不需要草稿）：',
+        `称呼用户时优先使用：${getPreferredDisplayName(diary)}。`,
+        `当前情绪模式：${mood.tag}。`,
+        `用户偏好语气：${profile.preferredTone || '未记录'}。`,
+        `用户常用表情：${(profile.commonEmoji || []).join(' ') || '未记录'}。`,
+        '可以使用 <i>*动作*</i> 和 <b>重点</b>，但不要全篇加粗。',
+        '不要输出 SAVE_MEMORY、YUNO_OBSESS 或任何 JSON。',
+    ].join('\n');
+}
+
 function buildConversationContext({ diary, normalizedMessage, routeDecision, relevantMemories, knowledgeChunks, mood }) {
     const sections = [
         {
@@ -236,6 +250,10 @@ function buildConversationContext({ diary, normalizedMessage, routeDecision, rel
             title: '回复任务',
             content: buildRouteGuidance(routeDecision),
         },
+        {
+            title: '输出风格',
+            content: buildStyleSection({ diary, mood }),
+        },
     ];
 
     return {
@@ -271,19 +289,19 @@ function buildFallbackReply(displayName, moodTag, routeType) {
     return moodFallbacks[moodTag] || moodFallbacks.NORMAL;
 }
 
-async function generateDraftReply({ openai, routeDecision, context, normalizedMessage }) {
+async function generateStyledReply({ openai, routeDecision, context, normalizedMessage }) {
     if (!hasAiClient(openai)) {
         return '';
     }
 
     const config = {
-        [ROUTE_TYPES.KNOWLEDGE_QA]: { temperature: 0.42, max_tokens: 320 },
-        [ROUTE_TYPES.EMOTION_SUPPORT]: { temperature: 0.82, max_tokens: 320 },
-        [ROUTE_TYPES.COLD_START]: { temperature: 0.88, max_tokens: 320 },
-        [ROUTE_TYPES.FOLLOW_UP]: { temperature: 0.8, max_tokens: 280 },
-        [ROUTE_TYPES.MEMORY_UPDATE_ONLY]: { temperature: 0.76, max_tokens: 280 },
-        [ROUTE_TYPES.GENERAL_CHAT]: { temperature: 0.86, max_tokens: 300 },
-    }[routeDecision.type] || { temperature: 0.82, max_tokens: 300 };
+        [ROUTE_TYPES.KNOWLEDGE_QA]: { temperature: 0.42, max_tokens: 380 },
+        [ROUTE_TYPES.EMOTION_SUPPORT]: { temperature: 0.82, max_tokens: 380 },
+        [ROUTE_TYPES.COLD_START]: { temperature: 0.88, max_tokens: 380 },
+        [ROUTE_TYPES.FOLLOW_UP]: { temperature: 0.8, max_tokens: 340 },
+        [ROUTE_TYPES.MEMORY_UPDATE_ONLY]: { temperature: 0.76, max_tokens: 340 },
+        [ROUTE_TYPES.GENERAL_CHAT]: { temperature: 0.86, max_tokens: 360 },
+    }[routeDecision.type] || { temperature: 0.82, max_tokens: 360 };
 
     const response = await openai.chat.completions.create({
         model: getChatModelName(false),
@@ -301,45 +319,6 @@ async function generateDraftReply({ openai, routeDecision, context, normalizedMe
         temperature: config.temperature,
         presence_penalty: 0.5,
         frequency_penalty: 0.2,
-    });
-
-    return stripToPlainText(getCompletionText(response));
-}
-
-async function rewriteStyleReply({ openai, routeDecision, draftText, diary, mood }) {
-    const cleanDraft = stripToPlainText(draftText);
-    if (!cleanDraft) {
-        return '';
-    }
-
-    if (!routeDecision.shouldUseStyleRewrite || !hasAiClient(openai)) {
-        return sanitizeTelegramHtml(cleanDraft);
-    }
-
-    const profile = diary.profile || {};
-    const response = await openai.chat.completions.create({
-        model: getChatModelName(true),
-        messages: [
-            {
-                role: 'system',
-                content: [
-                    '你是由乃的风格层，只负责把草稿改写成 Telegram 私聊里更像由乃的说法。',
-                    '保留原意，不要新增事实，不要改变结论。',
-                    `当前情绪模式：${mood.tag}。`,
-                    `称呼用户时优先使用：${getPreferredDisplayName(diary)}。`,
-                    `用户偏好语气：${profile.preferredTone || '未记录'}。`,
-                    `用户常用表情：${(profile.commonEmoji || []).join(' ') || '未记录'}。`,
-                    '输出 3 到 4 句中文，可以使用 <i>*动作*</i> 和 <b>重点</b>，但不要全篇都加粗。',
-                    '不要输出 SAVE_MEMORY、YUNO_OBSESS 或 JSON。',
-                ].join('\n'),
-            },
-            {
-                role: 'user',
-                content: cleanDraft,
-            },
-        ],
-        max_tokens: 320,
-        temperature: 0.8,
     });
 
     return sanitizeTelegramHtml(stripHiddenDirectives(getCompletionText(response)));
@@ -728,7 +707,6 @@ async function persistConversationState({ openai, diary, normalizedMessage, assi
     }
 
     touchDiary(diary);
-    syncDiaryCompatibilityFields(diary);
     if (!diary.session.threadSummary && diary.session.recentTurns.length > 0) {
         diary.session.threadSummary = buildThreadSummaryFallback({
             diary,
@@ -737,6 +715,8 @@ async function persistConversationState({ openai, diary, normalizedMessage, assi
             mood,
         });
     }
+    invalidateNormalized(diary);
+    syncDiaryCompatibilityFields(diary);
     await diary.save();
 }
 
@@ -773,18 +753,11 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
     let finalText = '';
 
     try {
-        const draftText = await generateDraftReply({
+        finalText = await generateStyledReply({
             openai,
             routeDecision,
             context,
             normalizedMessage,
-        });
-        finalText = await rewriteStyleReply({
-            openai,
-            routeDecision,
-            draftText,
-            diary,
-            mood,
         });
     } catch (error) {
         console.error('message orchestration failed:', error);
