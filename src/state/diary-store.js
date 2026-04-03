@@ -61,12 +61,14 @@ const profileSchema = new mongoose.Schema(
         nickname: { type: String, default: DEFAULT_NICKNAME },
         preferredName: { type: String, default: '' },
         preferredTone: { type: String, default: '' },
+        supportMode: { type: String, default: '' },
         topics: { type: [String], default: [] },
         boundaries: { type: [String], default: [] },
         interests: { type: [String], default: [] },
         commonEmoji: { type: [String], default: [] },
         greetingStyle: { type: String, default: '' },
         pushPreference: { type: String, default: '' },
+        pushWindows: { type: [String], default: [] },
         birthday: { type: String, default: '' },
     },
     { _id: false }
@@ -117,9 +119,6 @@ const Diary = mongoose.models.Diary || mongoose.model('Diary', diarySchema);
 
 const NORMALIZED = Symbol('normalized');
 
-/** @type {Map<string, any>} */
-const diaryCache = new Map();
-
 /**
  * Clear the normalized flag so the next ensureDiaryState call re-runs.
  * Call this after any mutation that changes state structure.
@@ -165,6 +164,39 @@ function extractEmojiTokens(text) {
 }
 
 /**
+ * @param {string} value
+ */
+function normalizeSupportMode(value) {
+    const mode = String(value || '').trim().toLowerCase();
+    if (['companion', 'clarify', 'quiet'].includes(mode)) {
+        return mode;
+    }
+    return '';
+}
+
+/**
+ * @param {string} value
+ */
+function normalizePushPreference(value) {
+    const preference = String(value || '').trim().toLowerCase();
+    if (['quiet', 'balanced', 'proactive'].includes(preference)) {
+        return preference;
+    }
+    return '';
+}
+
+/**
+ * @param {string} value
+ */
+function normalizePushWindow(value) {
+    const window = String(value || '').trim().toLowerCase();
+    if (['morning', 'afternoon', 'night'].includes(window)) {
+        return window;
+    }
+    return '';
+}
+
+/**
  * @param {Record<string, any>} [seed]
  */
 function createDefaultProfile(seed = {}) {
@@ -172,12 +204,16 @@ function createDefaultProfile(seed = {}) {
         nickname: seed.nickname || DEFAULT_NICKNAME,
         preferredName: seed.preferredName || '',
         preferredTone: seed.preferredTone || '',
+        supportMode: normalizeSupportMode(seed.supportMode),
         topics: Array.isArray(seed.topics) ? uniqueCompactStrings(seed.topics) : [],
         boundaries: Array.isArray(seed.boundaries) ? uniqueCompactStrings(seed.boundaries) : [],
         interests: Array.isArray(seed.interests) ? uniqueCompactStrings(seed.interests) : [],
         commonEmoji: Array.isArray(seed.commonEmoji) ? uniqueCompactStrings(seed.commonEmoji, 4) : [],
         greetingStyle: seed.greetingStyle || '',
-        pushPreference: seed.pushPreference || '',
+        pushPreference: normalizePushPreference(seed.pushPreference),
+        pushWindows: Array.isArray(seed.pushWindows)
+            ? seed.pushWindows.map(normalizePushWindow).filter(Boolean)
+            : [],
         birthday: seed.birthday || '',
     };
 }
@@ -573,12 +609,6 @@ function ensureDiaryState(diary) {
  * @param {Record<string, any>} [seed]
  */
 async function getOrCreateDiary(chatId, seed = {}) {
-    if (diaryCache.has(chatId)) {
-        const cached = diaryCache.get(chatId);
-        ensureDiaryState(cached);
-        return cached;
-    }
-
     let diary = await Diary.findOne({ chatId });
     if (!diary) {
         diary = new Diary({
@@ -591,7 +621,16 @@ async function getOrCreateDiary(chatId, seed = {}) {
     }
 
     ensureDiaryState(diary);
-    diaryCache.set(chatId, diary);
+    const seededNickname = stripToPlainText(seed.nickname || '').slice(0, 20);
+    if (
+        seededNickname &&
+        !diary.profile.preferredName &&
+        (!diary.profile.nickname || diary.profile.nickname === DEFAULT_NICKNAME)
+    ) {
+        diary.profile.nickname = seededNickname;
+        diary.nickname = seededNickname;
+        diary.markModified('profile');
+    }
     return diary;
 }
 
@@ -776,6 +815,85 @@ function upsertLongTermMemory(diary, memory) {
 
 /**
  * @param {any} diary
+ * @param {string} query
+ */
+function findLongTermMemoryMatches(diary, query) {
+    ensureDiaryState(diary);
+    const needle = stripToPlainText(query).toLowerCase();
+    if (!needle) {
+        return [];
+    }
+
+    return (diary.longTermMemories || [])
+        .map((memory, index) => ({
+            memory: normalizeMemory(memory),
+            index,
+        }))
+        .filter((entry) => entry.memory)
+        .filter((entry) => {
+            const haystack = `${entry.memory.key} ${entry.memory.value}`.toLowerCase();
+            return haystack.includes(needle);
+        });
+}
+
+/**
+ * @param {any} diary
+ * @param {string} query
+ */
+function removeLongTermMemory(diary, query) {
+    ensureDiaryState(diary);
+    invalidateNormalized(diary);
+
+    const matches = findLongTermMemoryMatches(diary, query);
+    if (matches.length === 0) {
+        return null;
+    }
+
+    const [selected] = matches;
+    diary.longTermMemories.splice(selected.index, 1);
+    if (selected.memory?.key) {
+        deleteLegacyRecord(diary, selected.memory.key);
+    }
+    diary.markModified('longTermMemories');
+    return selected.memory;
+}
+
+/**
+ * @param {any} diary
+ * @param {string} query
+ * @param {string} nextValue
+ */
+function updateLongTermMemoryValue(diary, query, nextValue) {
+    ensureDiaryState(diary);
+    invalidateNormalized(diary);
+
+    const matches = findLongTermMemoryMatches(diary, query);
+    if (matches.length === 0) {
+        return null;
+    }
+
+    const [selected] = matches;
+    const normalizedValue = stripToPlainText(nextValue);
+    if (!normalizedValue) {
+        return null;
+    }
+
+    const updatedMemory = {
+        ...selected.memory,
+        value: normalizedValue,
+        lastConfirmed: new Date(),
+        source: 'user-edit',
+    };
+    diary.longTermMemories[selected.index] = updatedMemory;
+    if (updatedMemory.key) {
+        setLegacyRecord(diary, updatedMemory.key, normalizedValue);
+    }
+    diary.markModified('longTermMemories');
+    return normalizeMemory(updatedMemory);
+}
+
+/**
+ * @param {any} diary
  * @param {{ saves?: Array<{key: string, value: string}>, obsessions?: string[] }} directives
  */
 function applyMemoryUpdates(diary, directives) {
@@ -905,6 +1023,23 @@ function getPreferredDisplayName(diary) {
  * @param {any} diary
  * @param {string} nickname
  */
+function setProfileNickname(diary, nickname) {
+    ensureDiaryState(diary);
+    invalidateNormalized(diary);
+    const safeName = stripToPlainText(nickname).slice(0, 20);
+    if (!safeName) {
+        return;
+    }
+
+    diary.profile.nickname = safeName;
+    diary.nickname = safeName;
+    diary.markModified('profile');
+}
+
+/**
+ * @param {any} diary
+ * @param {string} nickname
+ */
 function setPreferredDisplayName(diary, nickname) {
     ensureDiaryState(diary);
     invalidateNormalized(diary);
@@ -912,8 +1047,14 @@ function setPreferredDisplayName(diary, nickname) {
     if (!safeName) {
         return;
     }
-    diary.profile.nickname = safeName;
-    diary.nickname = safeName;
+
+    diary.profile.preferredName = safeName;
+    if (!diary.profile.nickname || diary.profile.nickname === DEFAULT_NICKNAME) {
+        diary.profile.nickname = safeName;
+    }
+    if (!diary.nickname || diary.nickname === DEFAULT_NICKNAME) {
+        diary.nickname = diary.profile.nickname;
+    }
     diary.markModified('profile');
 }
 
@@ -1097,6 +1238,9 @@ module.exports = {
     getVisibleMemoryEntries,
     selectRelevantMemories,
     upsertLongTermMemory,
+    findLongTermMemoryMatches,
+    removeLongTermMemory,
+    updateLongTermMemoryValue,
     applyMemoryUpdates,
     recordObsession,
     getObsessionCount,
@@ -1104,6 +1248,10 @@ module.exports = {
     parseBirthdayInput,
     getMonthDayInTimezone,
     getPreferredDisplayName,
+    normalizeSupportMode,
+    normalizePushPreference,
+    normalizePushWindow,
+    setProfileNickname,
     setPreferredDisplayName,
     setBirthday,
     getBirthday,

@@ -32,7 +32,14 @@ const {
     buildTopicKey,
     appendChapterSummary,
     shouldRollChapterSummary,
+    deleteLegacyRecord,
 } = require('./state/diary-store');
+const {
+    buildSupportModeKeyboard,
+    getSupportModeMeta,
+    getSupportModePrompt,
+} = require('./user-preferences');
+const { logRuntimeError } = require('./runtime-logging');
 
 const COLD_START_TOPIC_TREE = [
     '今天最想吐槽的一件小事',
@@ -260,7 +267,8 @@ function buildConversationContext({ diary, normalizedMessage, routeDecision, rel
         sections,
         systemPrompt: sections
             .map((section) => `### ${section.title}\n${section.content}`)
-            .join('\n\n'),
+            .join('\n\n')
+            .concat(`\n\n### 回应偏好\n${getSupportModePrompt(diary.profile?.supportMode || '')}`),
     };
 }
 
@@ -501,7 +509,11 @@ async function extractStableMemories({ openai, normalizedMessage, routeDecision 
             ],
         };
     } catch (error) {
-        console.warn(`memory extraction fallback: ${error.message}`);
+        logRuntimeError({
+            scope: 'orchestrator',
+            operation: 'extract_memory',
+            chatId: normalizedMessage.chat_id,
+        }, error);
         return heuristic;
     }
 }
@@ -613,7 +625,11 @@ async function refreshThreadSummary({ openai, diary, normalizedMessage, assistan
 
         return stripToPlainText(getCompletionText(response)).slice(0, 260);
     } catch (error) {
-        console.warn(`summary fallback: ${error.message}`);
+        logRuntimeError({
+            scope: 'orchestrator',
+            operation: 'refresh_summary',
+            chatId: normalizedMessage.chat_id,
+        }, error);
         return buildThreadSummaryFallback({ diary, normalizedMessage, assistantText, mood });
     }
 }
@@ -635,8 +651,34 @@ function buildObsessionNote({ diary, normalizedMessage, routeDecision, mood }) {
     return '';
 }
 
-async function persistConversationState({ openai, diary, normalizedMessage, assistantText, routeDecision, mood }) {
+function prepareMessageState({ diary, normalizedMessage }) {
     ensureDiaryState(diary);
+    applyEmotionDelta(diary, normalizedMessage.text);
+    const mood = updateMoodState(diary, normalizedMessage.text);
+    const routeDecision = decideRoute(normalizedMessage, diary);
+
+    return {
+        mood,
+        routeDecision,
+    };
+}
+
+async function persistConversationState({
+    openai,
+    diary,
+    normalizedMessage,
+    assistantText,
+    routeDecision,
+    mood,
+    skipSave = false,
+}) {
+    ensureDiaryState(diary);
+
+    const preparedState = routeDecision && mood
+        ? { routeDecision, mood }
+        : prepareMessageState({ diary, normalizedMessage });
+    const resolvedRouteDecision = routeDecision || preparedState.routeDecision;
+    const resolvedMood = mood || preparedState.mood;
 
     const userTurn = {
         role: 'user',
@@ -676,13 +718,13 @@ async function persistConversationState({ openai, diary, normalizedMessage, assi
             diary,
             normalizedMessage,
             assistantText,
-            mood,
+            mood: resolvedMood,
         });
         diary.session.threadSummary = refreshedSummary || buildThreadSummaryFallback({
             diary,
             normalizedMessage,
             assistantText,
-            mood,
+            mood: resolvedMood,
         });
         diary.session.turnsSinceSummary = 0;
         diary.session.summaryVersion = Number(diary.session.summaryVersion || 1) + 1;
@@ -690,8 +732,8 @@ async function persistConversationState({ openai, diary, normalizedMessage, assi
 
     diary.session.lastTopicKey = nextTopicKey;
 
-    const extracted = routeDecision.shouldExtractMemory
-        ? await extractStableMemories({ openai, normalizedMessage, routeDecision })
+    const extracted = resolvedRouteDecision.shouldExtractMemory
+        ? await extractStableMemories({ openai, normalizedMessage, routeDecision: resolvedRouteDecision })
         : null;
     applyExtractedMemories(diary, extracted);
 
@@ -701,31 +743,32 @@ async function persistConversationState({ openai, diary, normalizedMessage, assi
         diary.markModified('profile');
     }
 
-    const obsession = buildObsessionNote({ diary, normalizedMessage, routeDecision, mood });
+    const obsession = buildObsessionNote({ diary, normalizedMessage, routeDecision: resolvedRouteDecision, mood: resolvedMood });
     if (obsession) {
         recordObsession(diary, obsession);
     }
 
+    deleteLegacyRecord(diary, 'SYS_PENDING_FOLLOW_UP');
     touchDiary(diary);
     if (!diary.session.threadSummary && diary.session.recentTurns.length > 0) {
         diary.session.threadSummary = buildThreadSummaryFallback({
             diary,
             normalizedMessage,
             assistantText,
-            mood,
+            mood: resolvedMood,
         });
     }
     invalidateNormalized(diary);
     syncDiaryCompatibilityFields(diary);
-    await diary.save();
+    if (!skipSave) {
+        await diary.save();
+    }
 }
 
 async function orchestrateMessage({ openai, diary, normalizedMessage }) {
     ensureDiaryState(diary);
 
-    applyEmotionDelta(diary, normalizedMessage.text);
-    const mood = updateMoodState(diary, normalizedMessage.text);
-    const routeDecision = decideRoute(normalizedMessage, diary);
+    const { mood, routeDecision } = prepareMessageState({ diary, normalizedMessage });
     const relevantMemories = selectRelevantMemories(
         getVisibleMemoryEntries(diary),
         normalizedMessage.text
@@ -760,7 +803,11 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
             normalizedMessage,
         });
     } catch (error) {
-        console.error('message orchestration failed:', error);
+        logRuntimeError({
+            scope: 'orchestrator',
+            operation: 'generate_reply',
+            chatId: normalizedMessage.chat_id,
+        }, error);
     }
 
     if (!finalText) {
@@ -773,7 +820,7 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
         text: finalText,
         moodTag: mood.tag,
         routeDecision,
-        keyboard: buildKeyboard(mood.tag),
+        keyboard: [...buildKeyboard(mood.tag), buildSupportModeKeyboard(diary.profile?.supportMode || '')],
         context,
         persist: async () => persistConversationState({
             openai,
@@ -830,6 +877,7 @@ module.exports = {
     buildConversationContext,
     buildThreadSummaryFallback,
     extractStableMemoriesHeuristically,
+    prepareMessageState,
     orchestrateMessage,
     buildDiaryEntry,
     persistConversationState,

@@ -16,7 +16,15 @@ const {
     rerankKnowledgeChunks,
     searchKnowledge,
 } = require('./src/rag');
-const { ensureDiaryState } = require('./src/utils');
+const { createDiaryService } = require('./src/diary-service');
+const { normalizeMiniAppPayload, applyMiniAppPayload } = require('./src/miniapp');
+const setupCommands = require('./src/commands');
+const {
+    appendRecentTurn,
+    ensureDiaryState,
+    getLegacyRecordsMap,
+    upsertLongTermMemory,
+} = require('./src/utils');
 const {
     buildPersonalizedScheduledMessage,
     shouldSendScheduledMessage,
@@ -56,6 +64,103 @@ function createDiary(overrides = {}) {
 
     ensureDiaryState(diary);
     return diary;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createInMemoryDiaryService() {
+    const store = new Map();
+
+    return {
+        store,
+        service: createDiaryService({
+            loadDiary: async (chatId) => store.get(chatId) || null,
+            resolveDiary: async (chatId, seed = {}) => {
+                if (!store.has(chatId)) {
+                    store.set(chatId, createDiary({
+                        chatId,
+                        nickname: seed.nickname || '用户',
+                    }));
+                }
+
+                const diary = store.get(chatId);
+                ensureDiaryState(diary);
+                return diary;
+            },
+            saveDiary: async (diary) => {
+                store.set(String(diary.chatId || ''), diary);
+                return diary;
+            },
+            listActiveChatIds: async () => [...store.keys()],
+        }),
+    };
+}
+
+function createBotDouble() {
+    const commands = new Map();
+    const actions = [];
+    let startHandler = null;
+
+    return {
+        start(handler) {
+            startHandler = handler;
+        },
+        command(name, handler) {
+            commands.set(name, handler);
+        },
+        action(trigger, handler) {
+            actions.push({ trigger, handler });
+        },
+        getCommand(name) {
+            return commands.get(name);
+        },
+        getStart() {
+            return startHandler;
+        },
+        async runAction(callbackData, ctx) {
+            for (const entry of actions) {
+                if (typeof entry.trigger === 'string' && entry.trigger === callbackData) {
+                    await entry.handler(ctx);
+                    return true;
+                }
+
+                if (entry.trigger instanceof RegExp) {
+                    const match = callbackData.match(entry.trigger);
+                    if (match) {
+                        ctx.match = match;
+                        await entry.handler(ctx);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        },
+    };
+}
+
+function createContext(overrides = {}) {
+    const replies = [];
+    const answered = [];
+
+    return {
+        chat: { id: 'chat-1', type: 'private' },
+        from: { id: 1, first_name: '阿澄' },
+        message: { text: '', date: 1710000000 },
+        async reply(text, options = {}) {
+            replies.push({ text, options });
+            return { text, options };
+        },
+        async answerCbQuery(text = '', options = {}) {
+            answered.push({ text, options });
+        },
+        async sendChatAction() {},
+        __replies: replies,
+        __answered: answered,
+        ...overrides,
+    };
 }
 
 async function main() {
@@ -409,6 +514,129 @@ async function main() {
         assert.ok(legacyDiary.longTermMemories.some((memory) => memory.key === '偏好_饮料'));
         assert.equal(legacyDiary.session.recentTurns.length, 2);
         assert.equal(legacyDiary.profile.nickname, '旧昵称');
+    });
+
+    await runTest('diary service serializes rapid writes for the same chat', async () => {
+        const diary = createDiary();
+        const steps = [];
+        const service = createDiaryService({
+            loadDiary: async () => diary,
+            resolveDiary: async () => diary,
+            saveDiary: async () => diary,
+            listActiveChatIds: async () => ['chat-1'],
+        });
+
+        await Promise.all([
+            service.updateDiary('chat-1', async (target) => {
+                steps.push('start-1');
+                await sleep(20);
+                appendRecentTurn(target, {
+                    role: 'user',
+                    content: 'first',
+                    timestamp: new Date('2026-03-21T10:00:00.000Z'),
+                });
+                upsertLongTermMemory(target, {
+                    category: 'event',
+                    key: 'event:first',
+                    value: 'first',
+                    source: 'test',
+                    weight: 0.8,
+                });
+                steps.push('end-1');
+            }),
+            service.updateDiary('chat-1', async (target) => {
+                steps.push('start-2');
+                appendRecentTurn(target, {
+                    role: 'user',
+                    content: 'second',
+                    timestamp: new Date('2026-03-21T10:00:01.000Z'),
+                });
+                upsertLongTermMemory(target, {
+                    category: 'event',
+                    key: 'event:second',
+                    value: 'second',
+                    source: 'test',
+                    weight: 0.8,
+                });
+                steps.push('end-2');
+            }),
+        ]);
+
+        assert.deepEqual(steps, ['start-1', 'end-1', 'start-2', 'end-2']);
+        assert.equal(diary.session.recentTurns.length, 2);
+        assert.ok(diary.longTermMemories.some((memory) => memory.value === 'first'));
+        assert.ok(diary.longTermMemories.some((memory) => memory.value === 'second'));
+    });
+
+    await runTest('MiniApp structured payload writes follow-up context and tags', async () => {
+        const diary = createDiary();
+        const payload = normalizeMiniAppPayload(JSON.stringify({
+            action: 'submit_form',
+            event: '今天开了需求会',
+            details: '下周一前要给出改版方案',
+            mood: '有点紧张',
+            memory_type: 'long_term',
+            remember: true,
+            follow_up: true,
+            tags: ['工作', '排期'],
+            ts: 1710000000000,
+        }));
+
+        assert.ok(payload);
+        const result = applyMiniAppPayload(diary, payload);
+        const legacyRecords = getLegacyRecordsMap(diary);
+
+        assert.equal(result.remember, true);
+        assert.equal(result.followUp, true);
+        assert.ok(diary.profile.topics.includes('工作'));
+        assert.ok(diary.longTermMemories.some((memory) => /需求会/.test(memory.value)));
+        assert.equal(legacyRecords.get('SYS_PENDING_FOLLOW_UP'), payload.contextText);
+    });
+
+    await runTest('MiniApp legacy-only payload still falls back to text memory', async () => {
+        const diary = createDiary();
+        const payload = normalizeMiniAppPayload(JSON.stringify({
+            action: 'submit_form',
+            text: '旧版面板只会发这一段文本',
+        }));
+
+        assert.ok(payload);
+        assert.equal(payload.isLegacyOnly, true);
+
+        const result = applyMiniAppPayload(diary, payload);
+        assert.equal(result.remember, true);
+        assert.ok(diary.longTermMemories.some((memory) => /旧版面板/.test(memory.value)));
+    });
+
+    await runTest('/record command shows config hint or web app button', async () => {
+        const originalUrl = process.env.TELEGRAM_WEBAPP_URL;
+        const { service } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+
+        try {
+            delete process.env.TELEGRAM_WEBAPP_URL;
+            const withoutUrlCtx = createContext({
+                message: { text: '/record', date: 1710000000 },
+            });
+            await bot.getCommand('record')(withoutUrlCtx);
+            assert.match(withoutUrlCtx.__replies[0].text, /TELEGRAM_WEBAPP_URL/);
+
+            process.env.TELEGRAM_WEBAPP_URL = 'https://example.test/miniapp';
+            const withUrlCtx = createContext({
+                message: { text: '/record', date: 1710000000 },
+            });
+            await bot.getCommand('record')(withUrlCtx);
+
+            const keyboard = withUrlCtx.__replies[0].options.reply_markup.inline_keyboard;
+            assert.equal(keyboard[0][0].web_app.url, 'https://example.test/miniapp');
+        } finally {
+            if (originalUrl === undefined) {
+                delete process.env.TELEGRAM_WEBAPP_URL;
+            } else {
+                process.env.TELEGRAM_WEBAPP_URL = originalUrl;
+            }
+        }
     });
 
     if (failures > 0 || Number(process.exitCode || 0) > 0) {
