@@ -89,11 +89,23 @@ function getEffectivePushPreference(value) {
     return PUSH_PREFERENCE_META[key] ? key : DEFAULT_PUSH_PREFERENCE;
 }
 
-function getEnabledPushWindows(pushWindows) {
-    const windows = Array.isArray(pushWindows)
-        ? pushWindows.filter((value) => PUSH_WINDOW_META[value])
-        : [];
-    return windows.length > 0 ? windows : [...DEFAULT_PUSH_WINDOWS];
+function getEnabledPushWindows(pushWindows, pushWindowsConfigured = false) {
+    if (!Array.isArray(pushWindows)) {
+        return [...DEFAULT_PUSH_WINDOWS];
+    }
+
+    const unique = new Set();
+    for (const value of pushWindows) {
+        if (PUSH_WINDOW_META[value]) {
+            unique.add(value);
+        }
+    }
+
+    const normalized = DEFAULT_PUSH_WINDOWS.filter((value) => unique.has(value));
+    if (normalized.length === 0 && !pushWindowsConfigured) {
+        return [...DEFAULT_PUSH_WINDOWS];
+    }
+    return normalized;
 }
 
 function buildPushPreferenceKeyboard(value) {
@@ -115,7 +127,7 @@ function buildPushPreferenceKeyboard(value) {
 }
 
 function buildPushWindowKeyboard(pushWindows) {
-    const enabled = new Set(getEnabledPushWindows(pushWindows));
+    const enabled = new Set(getEnabledPushWindows(pushWindows, true));
     return [
         {
             text: markSelected(PUSH_WINDOW_META.morning.label, enabled.has('morning')),

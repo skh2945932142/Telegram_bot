@@ -7,6 +7,7 @@ const {
 } = require('./utils');
 const { trySendSticker, trySendVoice, logStickerFileId } = require('./media');
 const { normalizeTelegramMessage } = require('./adapter');
+const { ROUTE_TYPES } = require('./routing');
 const {
     orchestrateMessage,
     persistConversationState,
@@ -44,6 +45,11 @@ const MINIAPP_SAVE_ERROR_HTML = [
     '你稍后再发一次，我会重新收好。',
 ].join('\n');
 
+/** @type {Map<string, number>} */
+const groupHintNoticeMap = new Map();
+/** @type {Map<string, { pendingCtx: any, pendingMessages: string[], timer: NodeJS.Timeout | null, lastProcessedAt: number, lastNoticeAt: number }>} */
+const mergeCooldownMap = new Map();
+
 function replyHtml(ctx, text, extra = {}) {
     return ctx.reply(text, { parse_mode: 'HTML', ...extra });
 }
@@ -52,13 +58,75 @@ function shouldIgnoreTextMessage(userMessage) {
     return !userMessage || userMessage.startsWith('/');
 }
 
-async function maybeHandleCooldown(ctx, chatId) {
+function parsePositiveInteger(input, fallback) {
+    const value = Number(input);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function getMessageCooldownMode() {
+    return String(process.env.MESSAGE_COOLDOWN_MODE || 'merge_concat').trim().toLowerCase();
+}
+
+function getCooldownMs() {
+    return parsePositiveInteger(process.env.MESSAGE_COOLDOWN_MS, COOLDOWN_MS);
+}
+
+function getCooldownNoticeMs() {
+    return parsePositiveInteger(process.env.MESSAGE_COOLDOWN_NOTICE_MS, COOLDOWN_NOTICE_MS);
+}
+
+function getGroupPrivateHintCooldownMs() {
+    return parsePositiveInteger(process.env.GROUP_PRIVATE_HINT_COOLDOWN_MS, 300000);
+}
+
+function isGroupReplyMentionOnly() {
+    const raw = String(process.env.GROUP_REPLY_MENTION_ONLY || 'true').trim().toLowerCase();
+    return raw !== 'false';
+}
+
+function isReplyToBot(ctx) {
+    const replyTo = ctx.message?.reply_to_message;
+    if (!replyTo?.from) {
+        return false;
+    }
+
+    const botId = Number(ctx.botInfo?.id || 0);
+    const replyFromId = Number(replyTo.from.id || 0);
+    if (botId > 0 && replyFromId > 0 && botId === replyFromId) {
+        return true;
+    }
+
+    const botUsername = String(ctx.botInfo?.username || '').trim().toLowerCase();
+    const replyFromUsername = String(replyTo.from.username || '').trim().toLowerCase();
+    return Boolean(botUsername && replyFromUsername && botUsername === replyFromUsername);
+}
+
+function shouldHandleGroupHint(ctx, normalizedMessage) {
+    if (!isGroupReplyMentionOnly()) {
+        return true;
+    }
+    return Boolean(normalizedMessage.mentions_bot || isReplyToBot(ctx));
+}
+
+function shouldSendGroupHint(chatId) {
     const now = Date.now();
+    const lastNoticeAt = Number(groupHintNoticeMap.get(chatId) || 0);
+    if (now - lastNoticeAt < getGroupPrivateHintCooldownMs()) {
+        return false;
+    }
+    groupHintNoticeMap.set(chatId, now);
+    return true;
+}
+
+async function maybeHandleCooldownDrop(ctx, chatId) {
+    const now = Date.now();
+    const cooldownMs = getCooldownMs();
+    const cooldownNoticeMs = getCooldownNoticeMs();
     const lastSeen = cooldownMap.get(chatId);
 
-    if (lastSeen && now - lastSeen < COOLDOWN_MS) {
+    if (lastSeen && now - lastSeen < cooldownMs) {
         const lastNotice = cooldownNoticeMap.get(chatId) || 0;
-        if (now - lastNotice >= COOLDOWN_NOTICE_MS) {
+        if (now - lastNotice >= cooldownNoticeMs) {
             cooldownNoticeMap.set(chatId, now);
             await replyHtml(ctx, COOLING_DOWN_HTML);
         }
@@ -70,6 +138,124 @@ async function maybeHandleCooldown(ctx, chatId) {
         cooldownMap.delete(cooldownMap.keys().next().value);
     }
     return false;
+}
+
+function getMergeCooldownState(chatId) {
+    const existing = mergeCooldownMap.get(chatId);
+    if (existing) {
+        return existing;
+    }
+
+    const state = {
+        pendingCtx: null,
+        pendingMessages: [],
+        timer: null,
+        lastProcessedAt: 0,
+        lastNoticeAt: 0,
+    };
+    mergeCooldownMap.set(chatId, state);
+    return state;
+}
+
+async function maybeQueueMergedMessage(ctx, chatId, processMessage) {
+    const now = Date.now();
+    const mode = getMessageCooldownMode();
+    const cooldownMs = getCooldownMs();
+    const cooldownNoticeMs = getCooldownNoticeMs();
+    const state = getMergeCooldownState(chatId);
+    const elapsed = now - Number(state.lastProcessedAt || 0);
+    const canRunNow = state.lastProcessedAt <= 0 || elapsed >= cooldownMs;
+
+    if (canRunNow && !state.timer) {
+        state.lastProcessedAt = now;
+        return false;
+    }
+
+    state.pendingCtx = ctx;
+    if (mode === 'merge_concat') {
+        const normalizedMessage = normalizeTelegramMessage(ctx);
+        const text = String(normalizedMessage.text || '').trim();
+        if (text) {
+            state.pendingMessages.push(text);
+        }
+    } else {
+        state.pendingMessages = [];
+    }
+
+    if (now - Number(state.lastNoticeAt || 0) >= cooldownNoticeMs) {
+        state.lastNoticeAt = now;
+        await replyHtml(ctx, COOLING_DOWN_HTML);
+    }
+
+    if (state.timer) {
+        return true;
+    }
+
+    const waitMs = Math.max(0, cooldownMs - elapsed);
+    state.timer = setTimeout(() => {
+        void (async () => {
+            const queuedCtx = state.pendingCtx;
+            state.pendingCtx = null;
+            state.timer = null;
+
+            if (!queuedCtx) {
+                state.pendingMessages = [];
+                return;
+            }
+
+            state.lastProcessedAt = Date.now();
+            if (mode === 'merge_concat') {
+                const queuedMessage = normalizeTelegramMessage(queuedCtx);
+                const mergedText = state.pendingMessages.join('\n').trim();
+                state.pendingMessages = [];
+                const mergedNormalizedMessage = {
+                    ...queuedMessage,
+                    text: mergedText || queuedMessage.text,
+                    raw: {
+                        ...(queuedMessage.raw || {}),
+                        text: mergedText || queuedMessage.text,
+                    },
+                };
+                await processMessage(queuedCtx, mergedNormalizedMessage);
+                return;
+            }
+
+            state.pendingMessages = [];
+            await processMessage(queuedCtx, normalizeTelegramMessage(queuedCtx));
+        })();
+    }, waitMs);
+
+    return true;
+}
+
+function parseBooleanFlag(value, fallback = false) {
+    const text = String(value || '').trim().toLowerCase();
+    if (!text) {
+        return fallback;
+    }
+    return ['1', 'true', 'yes', 'on'].includes(text);
+}
+
+function getStickerDebugChatIdSet() {
+    const raw = String(process.env.STICKER_DEBUG_CHAT_IDS || '').trim();
+    if (!raw) {
+        return null;
+    }
+    const ids = raw.split(',').map((item) => item.trim()).filter(Boolean);
+    return new Set(ids);
+}
+
+function shouldHandleStickerDebug(ctx) {
+    if (!parseBooleanFlag(process.env.STICKER_DEBUG_ENABLED, false)) {
+        return false;
+    }
+
+    const allowedChatIds = getStickerDebugChatIdSet();
+    if (!allowedChatIds || allowedChatIds.size === 0) {
+        return true;
+    }
+
+    return allowedChatIds.has(String(ctx.chat?.id || ''));
 }
 
 function registerAction(bot, callbackData, queryText, replyText) {
@@ -103,6 +289,70 @@ function buildMiniAppReceipt(payload, result) {
 }
 
 module.exports = function setupHandlers(bot, openai, diaryService) {
+    async function handlePrivateText(ctx, normalizedMessage) {
+        const chatId = normalizedMessage.chat_id;
+        const userMessage = normalizedMessage.text;
+
+        console.log(`\n[${chatId}] ${userMessage}`);
+
+        try {
+            await ctx.sendChatAction('typing');
+
+            const diary = await diaryService.getOrCreateDiary(chatId, {
+                nickname: normalizedMessage.user_name,
+            });
+            const response = await orchestrateMessage({
+                openai,
+                diary,
+                normalizedMessage,
+            });
+
+            const replyOptions = response.keyboard?.length
+                ? {
+                    reply_markup: {
+                        inline_keyboard: response.keyboard,
+                    },
+                }
+                : {};
+
+            await replyHtml(ctx, response.text, replyOptions);
+
+            if (response.routeDecision?.type !== ROUTE_TYPES.SAFETY_CRISIS) {
+                const sentSticker = await trySendSticker(ctx, response.moodTag, 0.18);
+                if (!sentSticker) {
+                    await trySendVoice(ctx, response.text, response.moodTag, 0.08);
+                }
+            }
+
+            void diaryService.updateDiary(
+                chatId,
+                { nickname: normalizedMessage.user_name },
+                'handler:text_persist',
+                async (queuedDiary) => {
+                    const preparedState = prepareMessageState({
+                        diary: queuedDiary,
+                        normalizedMessage,
+                    });
+
+                    await persistConversationState({
+                        openai,
+                        diary: queuedDiary,
+                        normalizedMessage,
+                        assistantText: response.text,
+                        routeDecision: preparedState.routeDecision,
+                        mood: preparedState.mood,
+                        skipSave: true,
+                    });
+                }
+            ).catch((error) => {
+                logRuntimeError({ scope: 'handler', operation: 'text_persist', chatId }, error);
+            });
+        } catch (error) {
+            logRuntimeError({ scope: 'handler', operation: 'text', chatId }, error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
+    }
+
     bot.on('web_app_data', async (ctx) => {
         const chatId = String(ctx.chat?.id || '');
 
@@ -149,70 +399,29 @@ module.exports = function setupHandlers(bot, openai, diaryService) {
         }
 
         if (normalizedMessage.chat_type !== 'private') {
-            await replyHtml(ctx, PRIVATE_ONLY_HTML);
-            return;
-        }
-
-        if (await maybeHandleCooldown(ctx, chatId)) {
-            return;
-        }
-
-        console.log(`\n[${chatId}] ${userMessage}`);
-
-        try {
-            await ctx.sendChatAction('typing');
-
-            const diary = await diaryService.getOrCreateDiary(chatId, {
-                nickname: normalizedMessage.user_name,
-            });
-            const response = await orchestrateMessage({
-                openai,
-                diary,
-                normalizedMessage,
-            });
-
-            const replyOptions = response.keyboard?.length
-                ? {
-                    reply_markup: {
-                        inline_keyboard: response.keyboard,
-                    },
-                }
-                : {};
-
-            await replyHtml(ctx, response.text, replyOptions);
-
-            const sentSticker = await trySendSticker(ctx, response.moodTag, 0.18);
-            if (!sentSticker) {
-                await trySendVoice(ctx, response.text, response.moodTag, 0.08);
+            if (!shouldHandleGroupHint(ctx, normalizedMessage)) {
+                return;
             }
-
-            void diaryService.updateDiary(
-                chatId,
-                { nickname: normalizedMessage.user_name },
-                'handler:text_persist',
-                async (queuedDiary) => {
-                    const preparedState = prepareMessageState({
-                        diary: queuedDiary,
-                        normalizedMessage,
-                    });
-
-                    await persistConversationState({
-                        openai,
-                        diary: queuedDiary,
-                        normalizedMessage,
-                        assistantText: response.text,
-                        routeDecision: preparedState.routeDecision,
-                        mood: preparedState.mood,
-                        skipSave: true,
-                    });
-                }
-            ).catch((error) => {
-                logRuntimeError({ scope: 'handler', operation: 'text_persist', chatId }, error);
-            });
-        } catch (error) {
-            logRuntimeError({ scope: 'handler', operation: 'text', chatId }, error);
-            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+            if (shouldSendGroupHint(chatId)) {
+                await replyHtml(ctx, PRIVATE_ONLY_HTML);
+            }
+            return;
         }
+
+        const cooldownMode = getMessageCooldownMode();
+        if (cooldownMode === 'merge_last' || cooldownMode === 'merge_concat') {
+            const enqueued = await maybeQueueMergedMessage(ctx, chatId, async (queuedCtx, mergedMessage) => {
+                const queuedMessage = mergedMessage || normalizeTelegramMessage(queuedCtx);
+                await handlePrivateText(queuedCtx, queuedMessage);
+            });
+            if (enqueued) {
+                return;
+            }
+        } else if (await maybeHandleCooldownDrop(ctx, chatId)) {
+            return;
+        }
+
+        await handlePrivateText(ctx, normalizedMessage);
     });
 
     registerAction(
@@ -282,5 +491,10 @@ module.exports = function setupHandlers(bot, openai, diaryService) {
         '<i>*安静地看着你，没有催，也没有退*</i>\n等你下一句的时候，我会继续接住。'
     );
 
-    bot.on('sticker', logStickerFileId);
+    bot.on('sticker', async (ctx) => {
+        if (!shouldHandleStickerDebug(ctx)) {
+            return;
+        }
+        await logStickerFileId(ctx);
+    });
 };

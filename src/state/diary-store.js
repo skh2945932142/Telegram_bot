@@ -69,7 +69,12 @@ const profileSchema = new mongoose.Schema(
         greetingStyle: { type: String, default: '' },
         pushPreference: { type: String, default: '' },
         pushWindows: { type: [String], default: [] },
+        pushWindowsConfigured: { type: Boolean, default: false },
         birthday: { type: String, default: '' },
+        timeZone: { type: String, default: '' },
+        quietHoursEnabled: { type: Boolean, default: false },
+        quietHoursStart: { type: Number, default: 1380 },
+        quietHoursEnd: { type: Number, default: 480 },
     },
     { _id: false }
 );
@@ -178,10 +183,28 @@ function normalizeSupportMode(value) {
  * @param {string} value
  */
 function normalizePushPreference(value) {
-    const preference = String(value || '').trim().toLowerCase();
+    const raw = String(value || '').trim();
+    if (!raw) {
+        return '';
+    }
+
+    const preference = raw.toLowerCase();
     if (['quiet', 'balanced', 'proactive'].includes(preference)) {
         return preference;
     }
+
+    if (['安静', '安静一点', '少一点', '少一点主动', '别太频繁', '别太频繁提醒', '少打扰'].includes(raw)) {
+        return 'quiet';
+    }
+
+    if (['默认', '正常', '正常频率', '均衡'].includes(raw)) {
+        return 'balanced';
+    }
+
+    if (['主动', '主动一点', '多一点', '多一点主动', '多提醒我'].includes(raw)) {
+        return 'proactive';
+    }
+
     return '';
 }
 
@@ -189,17 +212,113 @@ function normalizePushPreference(value) {
  * @param {string} value
  */
 function normalizePushWindow(value) {
-    const window = String(value || '').trim().toLowerCase();
+    const raw = String(value || '').trim();
+    if (!raw) {
+        return '';
+    }
+
+    const window = raw.toLowerCase();
     if (['morning', 'afternoon', 'night'].includes(window)) {
         return window;
     }
+
+    if (['早上', '上午'].includes(raw)) {
+        return 'morning';
+    }
+    if (['下午', '午后'].includes(raw)) {
+        return 'afternoon';
+    }
+    if (['晚上', '夜里', '夜间'].includes(raw)) {
+        return 'night';
+    }
+
     return '';
+}
+
+/**
+ * @param {string} value
+ */
+function normalizeTimeZone(value) {
+    const zone = String(value || '').trim();
+    if (!zone) {
+        return '';
+    }
+
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: zone }).format(new Date());
+        return zone;
+    } catch (_error) {
+        return '';
+    }
+}
+
+/**
+ * @param {string} value
+ */
+function parseTimeStringToMinutes(value) {
+    const text = String(value || '').trim();
+    const match = text.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+    if (!match) {
+        return null;
+    }
+
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
+    return hour * 60 + minute;
+}
+
+/**
+ * @param {string | number} value
+ * @param {number} fallback
+ */
+function normalizeQuietHourMinute(value, fallback) {
+    const numberValue = Number(value);
+    if (Number.isFinite(numberValue) && numberValue >= 0 && numberValue < 1440) {
+        return Math.floor(numberValue);
+    }
+
+    const parsed = parseTimeStringToMinutes(String(value || ''));
+    if (parsed === null) {
+        return fallback;
+    }
+    return parsed;
+}
+
+/**
+ * @param {string} value
+ */
+function normalizeQuietHoursRange(value) {
+    const text = String(value || '').trim();
+    if (!text) {
+        return null;
+    }
+
+    const segments = text.split(/\s*-\s*/);
+    if (segments.length !== 2) {
+        return null;
+    }
+
+    const startMinutes = parseTimeStringToMinutes(segments[0]);
+    const endMinutes = parseTimeStringToMinutes(segments[1]);
+    if (startMinutes === null || endMinutes === null) {
+        return null;
+    }
+
+    return { startMinutes, endMinutes };
 }
 
 /**
  * @param {Record<string, any>} [seed]
  */
 function createDefaultProfile(seed = {}) {
+    const hasPushWindows = Array.isArray(seed.pushWindows);
+    const normalizedPushWindows = hasPushWindows
+        ? seed.pushWindows.map(normalizePushWindow).filter(Boolean)
+        : [];
+    const pushWindowsConfigured = Boolean(seed.pushWindowsConfigured);
+    const quietHoursStart = normalizeQuietHourMinute(seed.quietHoursStart, 23 * 60);
+    const quietHoursEnd = normalizeQuietHourMinute(seed.quietHoursEnd, 8 * 60);
+
     return {
         nickname: seed.nickname || DEFAULT_NICKNAME,
         preferredName: seed.preferredName || '',
@@ -211,10 +330,15 @@ function createDefaultProfile(seed = {}) {
         commonEmoji: Array.isArray(seed.commonEmoji) ? uniqueCompactStrings(seed.commonEmoji, 4) : [],
         greetingStyle: seed.greetingStyle || '',
         pushPreference: normalizePushPreference(seed.pushPreference),
-        pushWindows: Array.isArray(seed.pushWindows)
-            ? seed.pushWindows.map(normalizePushWindow).filter(Boolean)
-            : [],
+        pushWindows: hasPushWindows
+            ? (normalizedPushWindows.length > 0 || pushWindowsConfigured ? normalizedPushWindows : undefined)
+            : undefined,
+        pushWindowsConfigured,
         birthday: seed.birthday || '',
+        timeZone: normalizeTimeZone(seed.timeZone),
+        quietHoursEnabled: Boolean(seed.quietHoursEnabled),
+        quietHoursStart,
+        quietHoursEnd,
     };
 }
 
@@ -1251,6 +1375,10 @@ module.exports = {
     normalizeSupportMode,
     normalizePushPreference,
     normalizePushWindow,
+    normalizeTimeZone,
+    parseTimeStringToMinutes,
+    normalizeQuietHourMinute,
+    normalizeQuietHoursRange,
     setProfileNickname,
     setPreferredDisplayName,
     setBirthday,

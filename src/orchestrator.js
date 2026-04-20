@@ -29,6 +29,7 @@ const {
     mergeUniqueStrings,
     extractEmojiTokens,
     getSummaryContextText,
+    normalizePushPreference,
     buildTopicKey,
     appendChapterSummary,
     shouldRollChapterSummary,
@@ -297,6 +298,18 @@ function buildFallbackReply(displayName, moodTag, routeType) {
     return moodFallbacks[moodTag] || moodFallbacks.NORMAL;
 }
 
+function buildSafetyCrisisReply(displayName) {
+    const header = String(process.env.SAFETY_CRISIS_HEADER || '').trim()
+        || `${displayName}，我听到了你现在很痛苦，你的安全最重要。`;
+    const emergencyLine = String(process.env.SAFETY_CRISIS_EMERGENCY_LINE || '').trim()
+        || '如果你现在有立刻伤害自己的风险，请马上联系当地紧急电话或急诊。';
+    const supportLine = String(process.env.SAFETY_CRISIS_SUPPORT_LINE || '').trim()
+        || '也请立刻联系一个你信任的人，告诉对方你需要陪伴，不要一个人扛着。';
+    const closeLine = String(process.env.SAFETY_CRISIS_CLOSE_LINE || '').trim()
+        || '如果你愿意，只要回复我“还在”，我会继续陪你一步一步稳住。';
+    return [header, emergencyLine, supportLine, closeLine].join('\n');
+}
+
 async function generateStyledReply({ openai, routeDecision, context, normalizedMessage }) {
     if (!hasAiClient(openai)) {
         return '';
@@ -544,7 +557,10 @@ function applyExtractedMemories(diary, extracted) {
         profile.greetingStyle = updates.greetingStyle;
     }
     if (updates.pushPreference) {
-        profile.pushPreference = updates.pushPreference;
+        const normalizedPushPreference = normalizePushPreference(updates.pushPreference);
+        if (normalizedPushPreference) {
+            profile.pushPreference = normalizedPushPreference;
+        }
     }
 
     diary.profile = profile;
@@ -769,6 +785,27 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
     ensureDiaryState(diary);
 
     const { mood, routeDecision } = prepareMessageState({ diary, normalizedMessage });
+    const displayName = getPreferredDisplayName(diary);
+
+    if (routeDecision.type === ROUTE_TYPES.SAFETY_CRISIS) {
+        const safetyText = sanitizeTelegramHtml(stripHiddenDirectives(buildSafetyCrisisReply(displayName)));
+        return {
+            text: safetyText,
+            moodTag: mood.tag,
+            routeDecision,
+            keyboard: [],
+            context: null,
+            persist: async () => persistConversationState({
+                openai,
+                diary,
+                normalizedMessage,
+                assistantText: safetyText,
+                routeDecision,
+                mood,
+            }),
+        };
+    }
+
     const relevantMemories = selectRelevantMemories(
         getVisibleMemoryEntries(diary),
         normalizedMessage.text
@@ -792,7 +829,6 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
         mood,
     });
 
-    const displayName = getPreferredDisplayName(diary);
     let finalText = '';
 
     try {

@@ -8,6 +8,7 @@ const {
     buildConversationContext,
     buildThreadSummaryFallback,
     extractStableMemoriesHeuristically,
+    orchestrateMessage,
     persistConversationState,
 } = require('./src/orchestrator');
 const {
@@ -19,6 +20,8 @@ const {
 const { createDiaryService } = require('./src/diary-service');
 const { normalizeMiniAppPayload, applyMiniAppPayload } = require('./src/miniapp');
 const setupCommands = require('./src/commands');
+const setupHandlers = require('./src/handlers');
+const { buildBirthdayMessage } = require('./src/scheduler');
 const {
     appendRecentTurn,
     ensureDiaryState,
@@ -27,8 +30,10 @@ const {
 } = require('./src/utils');
 const {
     buildPersonalizedScheduledMessage,
+    isWithinQuietHours,
     shouldSendScheduledMessage,
 } = require('./src/personalization');
+const { getEnabledPushWindows } = require('./src/user-preferences');
 
 let failures = 0;
 
@@ -101,6 +106,9 @@ function createInMemoryDiaryService() {
 function createBotDouble() {
     const commands = new Map();
     const actions = [];
+    const hearRules = [];
+    /** @type {Map<string, Array<(ctx: any) => Promise<void> | void>>} */
+    const eventHandlers = new Map();
     let startHandler = null;
 
     return {
@@ -113,11 +121,44 @@ function createBotDouble() {
         action(trigger, handler) {
             actions.push({ trigger, handler });
         },
+        hears(trigger, handler) {
+            hearRules.push({ trigger, handler });
+        },
+        on(event, handler) {
+            const list = eventHandlers.get(event) || [];
+            list.push(handler);
+            eventHandlers.set(event, list);
+        },
         getCommand(name) {
             return commands.get(name);
         },
         getStart() {
             return startHandler;
+        },
+        async runHears(text, ctx) {
+            ctx.message = ctx.message || {};
+            ctx.message.text = text;
+            for (const entry of hearRules) {
+                if (entry.trigger instanceof RegExp) {
+                    const match = text.match(entry.trigger);
+                    if (!match) {
+                        continue;
+                    }
+                    ctx.match = match;
+                    await entry.handler(ctx);
+                    continue;
+                }
+
+                if (typeof entry.trigger === 'string' && entry.trigger === text) {
+                    await entry.handler(ctx);
+                }
+            }
+        },
+        async emit(event, ctx) {
+            const handlers = eventHandlers.get(event) || [];
+            for (const handler of handlers) {
+                await handler(ctx);
+            }
         },
         async runAction(callbackData, ctx) {
             for (const entry of actions) {
@@ -148,7 +189,8 @@ function createContext(overrides = {}) {
     return {
         chat: { id: 'chat-1', type: 'private' },
         from: { id: 1, first_name: '阿澄' },
-        message: { text: '', date: 1710000000 },
+        botInfo: { id: 999, username: 'demo_bot' },
+        message: { message_id: 1, text: '', date: 1710000000 },
         async reply(text, options = {}) {
             replies.push({ text, options });
             return { text, options };
@@ -195,6 +237,32 @@ async function main() {
         assert.equal(decideRoute({ text: '你的设定是什么', platform: 'telegram', chat_type: 'private' }, diary).type, 'knowledge_qa');
         assert.equal(decideRoute({ text: '然后呢', platform: 'telegram', chat_type: 'private' }, diary).type, 'follow_up');
         assert.equal(decideRoute({ text: '我今天真的很难受', platform: 'telegram', chat_type: 'private' }, diary).type, 'emotion_support');
+    });
+
+    await runTest('decideRoute classifies crisis intent as safety_crisis', async () => {
+        const diary = createDiary();
+        const decision = decideRoute({ text: '我不想活了', platform: 'telegram', chat_type: 'private' }, diary);
+        assert.equal(decision.type, 'safety_crisis');
+        assert.equal(decision.shouldExtractMemory, false);
+    });
+
+    await runTest('orchestrateMessage returns deterministic crisis response without keyboard', async () => {
+        const diary = createDiary();
+        const response = await orchestrateMessage({
+            openai: null,
+            diary,
+            normalizedMessage: {
+                platform: 'telegram',
+                chat_type: 'private',
+                chat_id: 'safety-chat',
+                text: '我想自杀',
+                timestamp: 1710000000,
+            },
+        });
+
+        assert.equal(response.routeDecision.type, 'safety_crisis');
+        assert.equal(response.keyboard.length, 0);
+        assert.match(response.text, /安全|紧急|急诊/);
     });
 
     await runTest('buildConversationContext keeps the section order stable', async () => {
@@ -439,6 +507,88 @@ async function main() {
         }
     });
 
+    await runTest('knowledge search respects remote budget and falls back when budget is exhausted', async () => {
+        const oldSearchApiUrl = process.env.SEARCH_API_URL;
+        const oldLocalThreshold = process.env.LOCAL_LOW_SCORE_THRESHOLD;
+        const oldBudget = process.env.REMOTE_SEARCH_TIME_BUDGET_MS;
+        const oldMaxPages = process.env.REMOTE_SEARCH_MAX_PAGES;
+        const originalFetch = global.fetch;
+
+        process.env.SEARCH_API_URL = 'https://example.test/search?q={query}';
+        process.env.LOCAL_LOW_SCORE_THRESHOLD = '999';
+        process.env.REMOTE_SEARCH_TIME_BUDGET_MS = '10';
+        process.env.REMOTE_SEARCH_MAX_PAGES = '2';
+
+        /** @type {typeof global.fetch} */
+        const mockedFetch = async (url) => {
+            if (String(url).startsWith('https://example.test/search')) {
+                await sleep(30);
+                return /** @type {Response} */ ({
+                    ok: true,
+                    async json() {
+                        return {
+                            results: [
+                                {
+                                    url: 'https://docs.example.test/slow-page',
+                                    title: 'Slow Page',
+                                    snippet: 'this page should be skipped by budget',
+                                },
+                            ],
+                        };
+                    },
+                });
+            }
+
+            return /** @type {Response} */ ({
+                ok: true,
+                async text() {
+                    return '<html><body>远程内容</body></html>';
+                },
+            });
+        };
+        global.fetch = mockedFetch;
+
+        try {
+            const results = await searchKnowledge({
+                openai: null,
+                diary: createDiary(),
+                normalizedMessage: {
+                    text: '由乃会怎么组织上下文',
+                },
+                routeDecision: {
+                    type: 'knowledge_qa',
+                },
+                platformScope: 'telegram_private',
+                limit: 4,
+            });
+
+            assert.ok(results.length > 0);
+            assert.ok(!results.some((chunk) => chunk.isRemote));
+        } finally {
+            global.fetch = originalFetch;
+            if (oldSearchApiUrl === undefined) {
+                delete process.env.SEARCH_API_URL;
+            } else {
+                process.env.SEARCH_API_URL = oldSearchApiUrl;
+            }
+            if (oldLocalThreshold === undefined) {
+                delete process.env.LOCAL_LOW_SCORE_THRESHOLD;
+            } else {
+                process.env.LOCAL_LOW_SCORE_THRESHOLD = oldLocalThreshold;
+            }
+            if (oldBudget === undefined) {
+                delete process.env.REMOTE_SEARCH_TIME_BUDGET_MS;
+            } else {
+                process.env.REMOTE_SEARCH_TIME_BUDGET_MS = oldBudget;
+            }
+            if (oldMaxPages === undefined) {
+                delete process.env.REMOTE_SEARCH_MAX_PAGES;
+            } else {
+                process.env.REMOTE_SEARCH_MAX_PAGES = oldMaxPages;
+            }
+        }
+    });
+
     await runTest('personalized scheduled messages use profile interests, emoji and push preference', async () => {
         const diary = createDiary({
             profile: {
@@ -451,6 +601,7 @@ async function main() {
                 commonEmoji: ['✨'],
                 greetingStyle: '像叫我起床一样',
                 pushPreference: '主动一点',
+                pushWindowsConfigured: false,
                 birthday: '',
             },
         });
@@ -461,7 +612,84 @@ async function main() {
         assert.match(morning, /✨/);
 
         diary.profile.pushPreference = '别太频繁';
+        diary.profile.pushWindowsConfigured = true;
+        diary.profile.pushWindows = ['afternoon'];
         assert.equal(shouldSendScheduledMessage(diary, 'afternoon'), false);
+    });
+
+    await runTest('push windows semantics keep [] as explicit off and undefined as default all', async () => {
+        const diary = createDiary();
+        diary.profile.pushWindows = undefined;
+        diary.profile.pushWindowsConfigured = false;
+        assert.deepEqual(getEnabledPushWindows(diary.profile.pushWindows, diary.profile.pushWindowsConfigured), ['morning', 'afternoon', 'night']);
+
+        diary.profile.pushWindows = [];
+        diary.profile.pushWindowsConfigured = true;
+        assert.deepEqual(getEnabledPushWindows(diary.profile.pushWindows, diary.profile.pushWindowsConfigured), []);
+        assert.equal(shouldSendScheduledMessage(diary, 'morning'), false);
+        assert.equal(shouldSendScheduledMessage(diary, 'afternoon'), false);
+        assert.equal(shouldSendScheduledMessage(diary, 'night'), false);
+    });
+
+    await runTest('/push off persists explicit full-off windows', async () => {
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+
+        const ctx = createContext({
+            chat: { id: 'push-off-chat', type: 'private' },
+            message: { text: '/push off', date: 1710000000, message_id: 1 },
+        });
+        await bot.getCommand('push')(ctx);
+
+        const diary = store.get('push-off-chat');
+        assert.deepEqual(diary.profile.pushWindows, []);
+        assert.equal(diary.profile.pushWindowsConfigured, true);
+        assert.equal(shouldSendScheduledMessage(diary, 'morning'), false);
+        assert.equal(shouldSendScheduledMessage(diary, 'afternoon'), false);
+        assert.equal(shouldSendScheduledMessage(diary, 'night'), false);
+    });
+
+    await runTest('/timezone and /quiet commands persist profile schedule settings', async () => {
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+
+        const zoneCtx = createContext({
+            chat: { id: 'schedule-chat', type: 'private' },
+            message: { text: '/timezone Asia/Shanghai', date: 1710000000, message_id: 1 },
+        });
+        await bot.getCommand('timezone')(zoneCtx);
+
+        const quietCtx = createContext({
+            chat: { id: 'schedule-chat', type: 'private' },
+            message: { text: '/quiet 23:00-08:00', date: 1710000001, message_id: 2 },
+        });
+        await bot.getCommand('quiet')(quietCtx);
+
+        const diary = store.get('schedule-chat');
+        assert.equal(diary.profile.timeZone, 'Asia/Shanghai');
+        assert.equal(diary.profile.quietHoursEnabled, true);
+        assert.equal(diary.profile.quietHoursStart, 23 * 60);
+        assert.equal(diary.profile.quietHoursEnd, 8 * 60);
+    });
+
+    await runTest('quiet hours suppress scheduled pushes based on user timezone', async () => {
+        const diary = createDiary();
+        diary.profile.pushWindowsConfigured = true;
+        diary.profile.pushWindows = ['morning', 'night'];
+        diary.profile.timeZone = 'Asia/Shanghai';
+        diary.profile.quietHoursEnabled = true;
+        diary.profile.quietHoursStart = 23 * 60;
+        diary.profile.quietHoursEnd = 8 * 60;
+
+        const inQuiet = new Date('2026-03-20T16:30:00.000Z'); // 00:30 Asia/Shanghai
+        const outQuiet = new Date('2026-03-20T02:30:00.000Z'); // 10:30 Asia/Shanghai
+
+        assert.equal(isWithinQuietHours(diary, { now: inQuiet, fallbackTimeZone: 'Asia/Shanghai' }), true);
+        assert.equal(shouldSendScheduledMessage(diary, 'morning', { now: inQuiet, fallbackTimeZone: 'Asia/Shanghai' }), false);
+        assert.equal(isWithinQuietHours(diary, { now: outQuiet, fallbackTimeZone: 'Asia/Shanghai' }), false);
+        assert.equal(shouldSendScheduledMessage(diary, 'morning', { now: outQuiet, fallbackTimeZone: 'Asia/Shanghai' }), true);
     });
 
     await runTest('persistConversationState rolls long summaries into chapter summaries on topic shift', async () => {
@@ -637,6 +865,234 @@ async function main() {
                 process.env.TELEGRAM_WEBAPP_URL = originalUrl;
             }
         }
+    });
+
+    await runTest('/help command and unknown command fallback are available', async () => {
+        const { service } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+
+        const helpCtx = createContext({
+            message: { text: '/help', date: 1710000000 },
+        });
+        await bot.getCommand('help')(helpCtx);
+        assert.match(helpCtx.__replies[0].text, /可用命令/);
+        assert.match(helpCtx.__replies[0].text, /\/push/);
+
+        const unknownCtx = createContext({
+            message: { text: '/unknown', date: 1710000000 },
+        });
+        await bot.runHears('/unknown', unknownCtx);
+        assert.match(unknownCtx.__replies[0].text, /\/help/);
+    });
+
+    await runTest('group private hint only responds to mention/reply and respects cooldown', async () => {
+        const oldMentionOnly = process.env.GROUP_REPLY_MENTION_ONLY;
+        const oldCooldown = process.env.GROUP_PRIVATE_HINT_COOLDOWN_MS;
+        process.env.GROUP_REPLY_MENTION_ONLY = 'true';
+        process.env.GROUP_PRIVATE_HINT_COOLDOWN_MS = '60000';
+
+        const { service } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupHandlers(bot, null, service);
+
+        try {
+            const groupSilent = createContext({
+                chat: { id: '-1001', type: 'group' },
+                message: { text: '大家好', date: 1710000000, message_id: 1 },
+            });
+            await bot.emit('text', groupSilent);
+            assert.equal(groupSilent.__replies.length, 0);
+
+            const groupMention = createContext({
+                chat: { id: '-1002', type: 'group' },
+                message: { text: '@demo_bot 在吗', date: 1710000000, message_id: 1 },
+            });
+            await bot.emit('text', groupMention);
+            assert.equal(groupMention.__replies.length, 1);
+            assert.match(groupMention.__replies[0].text, /私聊/);
+
+            const groupMentionAgain = createContext({
+                chat: { id: '-1002', type: 'group' },
+                message: { text: '@demo_bot 再问一次', date: 1710000001, message_id: 2 },
+            });
+            await bot.emit('text', groupMentionAgain);
+            assert.equal(groupMentionAgain.__replies.length, 0);
+        } finally {
+            if (oldMentionOnly === undefined) {
+                delete process.env.GROUP_REPLY_MENTION_ONLY;
+            } else {
+                process.env.GROUP_REPLY_MENTION_ONLY = oldMentionOnly;
+            }
+            if (oldCooldown === undefined) {
+                delete process.env.GROUP_PRIVATE_HINT_COOLDOWN_MS;
+            } else {
+                process.env.GROUP_PRIVATE_HINT_COOLDOWN_MS = oldCooldown;
+            }
+        }
+    });
+
+    await runTest('merge-last cooldown mode keeps latest private message', async () => {
+        const oldMode = process.env.MESSAGE_COOLDOWN_MODE;
+        const oldCooldown = process.env.MESSAGE_COOLDOWN_MS;
+        const oldNotice = process.env.MESSAGE_COOLDOWN_NOTICE_MS;
+        process.env.MESSAGE_COOLDOWN_MODE = 'merge_last';
+        process.env.MESSAGE_COOLDOWN_MS = '60';
+        process.env.MESSAGE_COOLDOWN_NOTICE_MS = '60000';
+
+        const { service } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupHandlers(bot, null, service);
+
+        try {
+            const firstCtx = createContext({
+                chat: { id: 'merge-test', type: 'private' },
+                message: { text: '第一条', date: 1710000000, message_id: 1 },
+            });
+            await bot.emit('text', firstCtx);
+
+            const secondCtx = createContext({
+                chat: { id: 'merge-test', type: 'private' },
+                message: { text: '第二条', date: 1710000001, message_id: 2 },
+            });
+            await bot.emit('text', secondCtx);
+            await sleep(120);
+
+            assert.ok(firstCtx.__replies.length >= 1);
+            assert.ok(secondCtx.__replies.length >= 1);
+        } finally {
+            if (oldMode === undefined) {
+                delete process.env.MESSAGE_COOLDOWN_MODE;
+            } else {
+                process.env.MESSAGE_COOLDOWN_MODE = oldMode;
+            }
+            if (oldCooldown === undefined) {
+                delete process.env.MESSAGE_COOLDOWN_MS;
+            } else {
+                process.env.MESSAGE_COOLDOWN_MS = oldCooldown;
+            }
+            if (oldNotice === undefined) {
+                delete process.env.MESSAGE_COOLDOWN_NOTICE_MS;
+            } else {
+                process.env.MESSAGE_COOLDOWN_NOTICE_MS = oldNotice;
+            }
+        }
+    });
+
+    await runTest('merge-concat cooldown mode keeps all queued private messages', async () => {
+        const oldMode = process.env.MESSAGE_COOLDOWN_MODE;
+        const oldCooldown = process.env.MESSAGE_COOLDOWN_MS;
+        const oldNotice = process.env.MESSAGE_COOLDOWN_NOTICE_MS;
+        process.env.MESSAGE_COOLDOWN_MODE = 'merge_concat';
+        process.env.MESSAGE_COOLDOWN_MS = '60';
+        process.env.MESSAGE_COOLDOWN_NOTICE_MS = '60000';
+
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupHandlers(bot, null, service);
+
+        try {
+            const firstCtx = createContext({
+                chat: { id: 'concat-test', type: 'private' },
+                message: { text: '第一条', date: 1710000000, message_id: 1 },
+            });
+            await bot.emit('text', firstCtx);
+
+            const secondCtx = createContext({
+                chat: { id: 'concat-test', type: 'private' },
+                message: { text: '第二条', date: 1710000001, message_id: 2 },
+            });
+            await bot.emit('text', secondCtx);
+
+            const thirdCtx = createContext({
+                chat: { id: 'concat-test', type: 'private' },
+                message: { text: '第三条', date: 1710000002, message_id: 3 },
+            });
+            await bot.emit('text', thirdCtx);
+
+            await sleep(260);
+            await sleep(260);
+
+            const diary = store.get('concat-test');
+            const userTurns = (diary?.session?.recentTurns || []).filter((turn) => turn.role === 'user');
+            const mergedTurn = userTurns.find((turn) => /第二条/.test(turn.content) && /第三条/.test(turn.content));
+            assert.ok(mergedTurn);
+            assert.match(mergedTurn.content, /第二条\s*第三条/);
+        } finally {
+            if (oldMode === undefined) {
+                delete process.env.MESSAGE_COOLDOWN_MODE;
+            } else {
+                process.env.MESSAGE_COOLDOWN_MODE = oldMode;
+            }
+            if (oldCooldown === undefined) {
+                delete process.env.MESSAGE_COOLDOWN_MS;
+            } else {
+                process.env.MESSAGE_COOLDOWN_MS = oldCooldown;
+            }
+            if (oldNotice === undefined) {
+                delete process.env.MESSAGE_COOLDOWN_NOTICE_MS;
+            } else {
+                process.env.MESSAGE_COOLDOWN_NOTICE_MS = oldNotice;
+            }
+        }
+    });
+
+    await runTest('sticker debug reply is disabled by default and only enabled explicitly', async () => {
+        const oldEnabled = process.env.STICKER_DEBUG_ENABLED;
+        const oldChatIds = process.env.STICKER_DEBUG_CHAT_IDS;
+        const { service } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupHandlers(bot, null, service);
+
+        try {
+            delete process.env.STICKER_DEBUG_ENABLED;
+            delete process.env.STICKER_DEBUG_CHAT_IDS;
+            const disabledCtx = createContext({
+                chat: { id: 'sticker-chat', type: 'private' },
+                message: {
+                    sticker: {
+                        file_id: 'sticker-file-id',
+                        emoji: '🙂',
+                        set_name: 'test_set',
+                    },
+                },
+            });
+            await bot.emit('sticker', disabledCtx);
+            assert.equal(disabledCtx.__replies.length, 0);
+
+            process.env.STICKER_DEBUG_ENABLED = 'true';
+            process.env.STICKER_DEBUG_CHAT_IDS = 'sticker-chat';
+            const enabledCtx = createContext({
+                chat: { id: 'sticker-chat', type: 'private' },
+                message: {
+                    sticker: {
+                        file_id: 'sticker-file-id-2',
+                        emoji: '🙂',
+                        set_name: 'test_set',
+                    },
+                },
+            });
+            await bot.emit('sticker', enabledCtx);
+            assert.equal(enabledCtx.__replies.length, 1);
+            assert.match(enabledCtx.__replies[0].text, /file_id/);
+        } finally {
+            if (oldEnabled === undefined) {
+                delete process.env.STICKER_DEBUG_ENABLED;
+            } else {
+                process.env.STICKER_DEBUG_ENABLED = oldEnabled;
+            }
+            if (oldChatIds === undefined) {
+                delete process.env.STICKER_DEBUG_CHAT_IDS;
+            } else {
+                process.env.STICKER_DEBUG_CHAT_IDS = oldChatIds;
+            }
+        }
+    });
+
+    await runTest('birthday message template is readable utf-8 text', async () => {
+        const birthdayMessage = buildBirthdayMessage('阿澈');
+        assert.match(birthdayMessage, /今天是 阿澈 的生日/);
+        assert.doesNotMatch(birthdayMessage, /�/);
     });
 
     if (failures > 0 || Number(process.exitCode || 0) > 0) {

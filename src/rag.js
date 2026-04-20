@@ -15,6 +15,9 @@ const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS || 12000);
 const REMOTE_PAGE_MAX_LENGTH = Number(process.env.SEARCH_PAGE_MAX_LENGTH || 6000);
 const REMOTE_CHUNK_SIZE = Number(process.env.SEARCH_CHUNK_SIZE || 420);
 const REMOTE_CHUNK_OVERLAP = Number(process.env.SEARCH_CHUNK_OVERLAP || 60);
+const DEFAULT_REMOTE_SEARCH_TIME_BUDGET_MS = 6000;
+const DEFAULT_REMOTE_SEARCH_MAX_PAGES = 2;
+const DEFAULT_REMOTE_SEARCH_CONCURRENCY = 2;
 
 /** @type {Map<string, { expiresAt: number, value: any }>} */
 const searchCache = new Map();
@@ -443,6 +446,24 @@ function buildAbortSignal(timeoutMs) {
     return undefined;
 }
 
+function toPositiveInteger(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function getRemoteSearchTimeBudgetMs() {
+    return toPositiveInteger(process.env.REMOTE_SEARCH_TIME_BUDGET_MS, DEFAULT_REMOTE_SEARCH_TIME_BUDGET_MS);
+}
+
+function getRemoteSearchMaxPages() {
+    return toPositiveInteger(process.env.REMOTE_SEARCH_MAX_PAGES, DEFAULT_REMOTE_SEARCH_MAX_PAGES);
+}
+
+function getRemoteSearchConcurrency(maxPages) {
+    const configured = toPositiveInteger(process.env.REMOTE_SEARCH_CONCURRENCY, DEFAULT_REMOTE_SEARCH_CONCURRENCY);
+    return Math.max(1, Math.min(maxPages, configured));
+}
+
 /**
  * @param {any} payload
  */
@@ -459,7 +480,7 @@ function extractSearchItems(payload) {
 /**
  * @param {string} query
  */
-async function fetchRemoteSearchResults(query) {
+async function fetchRemoteSearchResults(query, timeoutMs = SEARCH_TIMEOUT_MS) {
     const cacheKey = `search:${query}`;
     const cached = readCache(cacheKey, searchCache);
     if (cached) {
@@ -476,7 +497,7 @@ async function fetchRemoteSearchResults(query) {
             Accept: 'application/json,text/plain;q=0.8,*/*;q=0.5',
             ...(process.env.SEARCH_API_KEY ? { Authorization: `Bearer ${process.env.SEARCH_API_KEY}` } : {}),
         },
-        signal: buildAbortSignal(SEARCH_TIMEOUT_MS),
+        signal: buildAbortSignal(timeoutMs),
     });
 
     if (!response.ok) {
@@ -516,7 +537,7 @@ function extractHtmlText(html) {
 /**
  * @param {string} url
  */
-async function fetchSearchDocument(url) {
+async function fetchSearchDocument(url, timeoutMs = SEARCH_TIMEOUT_MS) {
     const cacheKey = `page:${url}`;
     const cached = readCache(cacheKey, pageCache);
     if (cached) {
@@ -528,7 +549,7 @@ async function fetchSearchDocument(url) {
             'User-Agent': 'my-telegram-bot/knowledge-fetcher',
             Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
-        signal: buildAbortSignal(SEARCH_TIMEOUT_MS),
+        signal: buildAbortSignal(timeoutMs),
     });
 
     if (!response.ok) {
@@ -593,18 +614,45 @@ function chunkRemoteDocument(document, platformScope) {
  * @param {string} platformScope
  */
 async function searchKnowledgeRemotely(query, platformScope) {
-    const results = await fetchRemoteSearchResults(query);
-    const documents = [];
-
-    for (const result of results.slice(0, 3)) {
-        try {
-            const document = await fetchSearchDocument(result.url);
-            documents.push(document);
-        } catch (error) {
-            console.warn(`remote page fetch skipped [${result.url}]: ${error.message}`);
-        }
+    const budgetMs = getRemoteSearchTimeBudgetMs();
+    const maxPages = getRemoteSearchMaxPages();
+    const concurrency = getRemoteSearchConcurrency(maxPages);
+    const deadline = Date.now() + budgetMs;
+    const remainingForSearch = deadline - Date.now();
+    if (remainingForSearch <= 0) {
+        return [];
     }
 
+    const results = await fetchRemoteSearchResults(query, remainingForSearch);
+    const targets = results.slice(0, maxPages);
+    /** @type {Array<{ url: string, title: string, content: string }>} */
+    const documents = [];
+    let cursor = 0;
+
+    const workers = Array.from({ length: concurrency }, async () => {
+        while (cursor < targets.length) {
+            const index = cursor;
+            cursor += 1;
+            const result = targets[index];
+            if (!result?.url) {
+                continue;
+            }
+
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) {
+                return;
+            }
+
+            try {
+                const document = await fetchSearchDocument(result.url, remaining);
+                documents.push(document);
+            } catch (error) {
+                console.warn(`remote page fetch skipped [${result.url}]: ${error.message}`);
+            }
+        }
+    });
+
+    await Promise.all(workers);
     return documents.flatMap((document) => chunkRemoteDocument(document, platformScope));
 }
 

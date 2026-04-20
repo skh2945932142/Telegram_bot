@@ -11,6 +11,8 @@ const {
     getVisibleMemoryEntries,
     normalizePushPreference,
     normalizePushWindow,
+    normalizeQuietHoursRange,
+    normalizeTimeZone,
     normalizeSupportMode,
     parseBirthdayInput,
     removeLongTermMemory,
@@ -80,6 +82,63 @@ const SUPPORT_MODE_ALIASES = {
     '别追问': 'quiet',
     '别追问了': 'quiet',
 };
+
+const QUIET_OFF_TOKENS = new Set([
+    'off',
+    'none',
+    'disable',
+    'disabled',
+    'stop',
+    '关闭',
+    '关',
+    '停用',
+]);
+
+const DEFAULT_TIME_ZONE = 'Asia/Shanghai';
+
+const HELP_COMMANDS = [
+    '• <code>/start</code> 重新查看入口面板',
+    '• <code>/help</code> 查看命令和示例',
+    '• <code>/record</code> 打开记录面板（仅私聊）',
+    '• <code>/memory</code> 查看长期记忆',
+    '• <code>/recent</code> 查看最近记录与待跟进线索',
+    '• <code>/forget 关键词</code> 删除一条记忆',
+    '• <code>/editmemory 关键词 =&gt; 新内容</code> 修改一条记忆',
+    '• <code>/mode 只陪我|帮我理一下|别追问了</code> 调回应方式',
+    '• <code>/push 安静一点|正常|多一点主动 [早上 下午 晚上]</code> 调提醒偏好',
+    '• <code>/timezone Asia/Shanghai</code> 设置时区（IANA）',
+    '• <code>/quiet 23:00-08:00</code> 设置免打扰，<code>/quiet off</code> 关闭',
+    '• <code>/nickname 名字</code> 设置称呼',
+    '• <code>/birthday 3-15</code> 设置生日',
+    '• <code>/status</code> 查看当前状态',
+    '• <code>/mood</code> 查看情绪与摘要状态',
+    '• <code>/diary</code> 生成今日日记',
+    '• <code>/reset</code> 重置会话和记忆（需确认）',
+];
+
+const KNOWN_COMMANDS = new Set([
+    'start',
+    'help',
+    'mood',
+    'memory',
+    'recent',
+    'forget',
+    'editmemory',
+    'mode',
+    'push',
+    'reset',
+    'hug',
+    'target',
+    'promise',
+    'diary',
+    'stalk',
+    'birthday',
+    'timezone',
+    'quiet',
+    'record',
+    'status',
+    'nickname',
+]);
 
 function replyHtml(ctx, text, extra = {}) {
     return ctx.reply(text, { parse_mode: 'HTML', ...extra });
@@ -201,6 +260,53 @@ function parsePushArgs(args) {
     };
 }
 
+function parseQuietArgs(args) {
+    const text = String(args || '').trim();
+    if (!text) {
+        return null;
+    }
+
+    const lowered = text.toLowerCase();
+    if (QUIET_OFF_TOKENS.has(lowered)) {
+        return { enabled: false };
+    }
+
+    const normalized = text.replace(/[~～到至]/g, '-');
+    const range = normalizeQuietHoursRange(normalized);
+    if (!range) {
+        return null;
+    }
+
+    return {
+        enabled: true,
+        startMinutes: range.startMinutes,
+        endMinutes: range.endMinutes,
+    };
+}
+
+function formatTimeFromMinutes(value) {
+    const minutes = Number(value);
+    if (!Number.isFinite(minutes) || minutes < 0 || minutes >= 1440) {
+        return '--:--';
+    }
+    const hour = Math.floor(minutes / 60);
+    const minute = Math.floor(minutes % 60);
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+function getDiaryTimeZone(diary) {
+    ensureDiaryState(diary);
+    return normalizeTimeZone(diary.profile?.timeZone) || DEFAULT_TIME_ZONE;
+}
+
+function formatQuietHoursLabel(diary) {
+    ensureDiaryState(diary);
+    if (!diary.profile?.quietHoursEnabled) {
+        return '关闭';
+    }
+    return `${formatTimeFromMinutes(diary.profile?.quietHoursStart)}-${formatTimeFromMinutes(diary.profile?.quietHoursEnd)}`;
+}
+
 function buildStartText(displayName) {
     return [
         '<i>*把新的一页推到你面前，又把笔轻轻放稳*</i>',
@@ -212,6 +318,18 @@ function buildStartText(displayName) {
         '3. 查看记忆：用 <code>/memory</code> 看长期记忆，用 <code>/recent</code> 看最近写进去的内容。',
         '',
         '想改称呼可以用 <code>/nickname</code>，想调整回应方式用 <code>/mode</code>，想改提醒频率用 <code>/push</code>。',
+        '需要完整命令清单时，发 <code>/help</code>。',
+    ].join('\n');
+}
+
+function buildHelpText() {
+    return [
+        '<b>可用命令</b>',
+        '<i>*把常用入口整理成一页给你*</i>',
+        '',
+        ...HELP_COMMANDS,
+        '',
+        '提示：群聊里默认只在 @我 或回复我的消息时提醒你切到私聊。',
     ].join('\n');
 }
 
@@ -321,21 +439,63 @@ function buildModeText(diary) {
 function buildPushText(diary) {
     ensureDiaryState(diary);
     const pushMeta = getPushPreferenceMeta(diary.profile?.pushPreference || '');
-    const windows = getEnabledPushWindows(diary.profile?.pushWindows);
+    const windows = getEnabledPushWindows(diary.profile?.pushWindows, diary.profile?.pushWindowsConfigured);
     const windowLabelMap = {
         morning: '早上',
         afternoon: '下午',
         night: '晚上',
     };
 
+    const windowsLabel = windows.length > 0
+        ? windows.map((key) => windowLabelMap[key] || key).join(' / ')
+        : '未开启';
+
     return [
         '<b>【提醒偏好】</b>',
         '<i>*把打扰和陪伴之间的距离调给你看*</i>',
         `当前频率：<b>${escapeHtml(pushMeta.label)}</b>`,
         escapeHtml(pushMeta.summary),
-        `开启时段：<b>${escapeHtml(windows.map((key) => windowLabelMap[key] || key).join(' / '))}</b>`,
+        `开启时段：<b>${escapeHtml(windowsLabel)}</b>`,
+        `免打扰：<b>${escapeHtml(formatQuietHoursLabel(diary))}</b>`,
         '',
         '你也可以直接发：<code>/push 安静一点 下午 晚上</code> 或 <code>/push 正常</code>',
+    ].join('\n');
+}
+
+function buildTimezoneText(diary) {
+    ensureDiaryState(diary);
+    const timeZone = getDiaryTimeZone(diary);
+    const now = new Intl.DateTimeFormat('zh-CN', {
+        timeZone,
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+    }).format(new Date());
+
+    return [
+        '<b>【时区设置】</b>',
+        '<i>*把提醒和生日对齐到你的本地时间*</i>',
+        `当前时区：<b>${escapeHtml(timeZone)}</b>`,
+        `当前本地时间：<b>${escapeHtml(now)}</b>`,
+        '',
+        '可用格式：<code>/timezone Asia/Shanghai</code>、<code>/timezone America/Los_Angeles</code>',
+        '重置为默认：<code>/timezone reset</code>',
+    ].join('\n');
+}
+
+function buildQuietText(diary) {
+    ensureDiaryState(diary);
+    const timeZone = getDiaryTimeZone(diary);
+    return [
+        '<b>【免打扰】</b>',
+        '<i>*在你需要安静的时段暂停主动提醒*</i>',
+        `当前状态：<b>${escapeHtml(formatQuietHoursLabel(diary))}</b>`,
+        `当前时区：<b>${escapeHtml(timeZone)}</b>`,
+        '',
+        '设置：<code>/quiet 23:00-08:00</code>',
+        '关闭：<code>/quiet off</code>',
     ].join('\n');
 }
 
@@ -374,7 +534,10 @@ function buildStatusText(diary) {
     const obsessCount = getObsessionCount(diary);
     const supportMode = getSupportModeMeta(diary.profile?.supportMode || '');
     const pushMeta = getPushPreferenceMeta(diary.profile?.pushPreference || '');
-    const windows = getEnabledPushWindows(diary.profile?.pushWindows);
+    const windows = getEnabledPushWindows(diary.profile?.pushWindows, diary.profile?.pushWindowsConfigured);
+    const windowsLabel = windows.length > 0
+        ? windows.map((key) => windowLabelMap[key] || key).join(' / ')
+        : '未开启';
 
     return [
         `${moodEmoji[mood.tag] || '🙂'} <b>【当前状态】</b>`,
@@ -389,13 +552,15 @@ function buildStatusText(diary) {
         `内心独白：<b>${obsessCount}</b> 条`,
         `回应方式：<b>${escapeHtml(supportMode.label)}</b>`,
         `提醒频率：<b>${escapeHtml(pushMeta.label)}</b>`,
-        `提醒时段：<b>${escapeHtml(windows.map((key) => windowLabelMap[key] || key).join(' / '))}</b>`,
+        `提醒时段：<b>${escapeHtml(windowsLabel)}</b>`,
+        `时区：<b>${escapeHtml(getDiaryTimeZone(diary))}</b>`,
+        `免打扰：<b>${escapeHtml(formatQuietHoursLabel(diary))}</b>`,
     ].join('\n');
 }
 
 function togglePushWindow(diary, windowKey) {
     ensureDiaryState(diary);
-    const current = new Set(getEnabledPushWindows(diary.profile?.pushWindows));
+    const current = new Set(getEnabledPushWindows(diary.profile?.pushWindows, diary.profile?.pushWindowsConfigured));
     if (current.has(windowKey)) {
         current.delete(windowKey);
     } else {
@@ -403,6 +568,7 @@ function togglePushWindow(diary, windowKey) {
     }
 
     diary.profile.pushWindows = DEFAULT_PUSH_WINDOWS.filter((key) => current.has(key));
+    diary.profile.pushWindowsConfigured = true;
     diary.markModified('profile');
     return diary.profile.pushWindows;
 }
@@ -446,6 +612,16 @@ async function sendPushPanel(ctx, diaryService, chatId, seedNickname = '') {
             ],
         },
     });
+}
+
+async function sendTimezonePanel(ctx, diaryService, chatId, seedNickname = '') {
+    const diary = await diaryService.getOrCreateDiary(chatId, { nickname: seedNickname || DEFAULT_NICKNAME });
+    await replyHtml(ctx, buildTimezoneText(diary));
+}
+
+async function sendQuietPanel(ctx, diaryService, chatId, seedNickname = '') {
+    const diary = await diaryService.getOrCreateDiary(chatId, { nickname: seedNickname || DEFAULT_NICKNAME });
+    await replyHtml(ctx, buildQuietText(diary));
 }
 
 module.exports = function setupCommands(bot, openai, diaryService) {
@@ -502,6 +678,10 @@ module.exports = function setupCommands(bot, openai, diaryService) {
             logRuntimeError({ scope: 'command', operation: 'memory', chatId }, error);
             await replyHtml(ctx, FALLBACK_ERROR_HTML);
         }
+    });
+
+    bot.command('help', async (ctx) => {
+        await replyHtml(ctx, buildHelpText());
     });
 
     bot.command('recent', async (ctx) => {
@@ -716,6 +896,7 @@ module.exports = function setupCommands(bot, openai, diaryService) {
                     }
                     if (parsed.windows !== null) {
                         diary.profile.pushWindows = parsed.windows;
+                        diary.profile.pushWindowsConfigured = true;
                     }
                     diary.markModified('profile');
                 }
@@ -724,6 +905,89 @@ module.exports = function setupCommands(bot, openai, diaryService) {
             await sendPushPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
         } catch (error) {
             logRuntimeError({ scope: 'command', operation: 'push', chatId }, error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
+    });
+
+    bot.command('timezone', async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        const args = getCommandArgs(ctx);
+
+        try {
+            if (!args) {
+                await sendTimezonePanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+                return;
+            }
+
+            const lowered = String(args || '').trim().toLowerCase();
+            const nextTimeZone = ['reset', 'default', 'auto'].includes(lowered)
+                ? ''
+                : normalizeTimeZone(args);
+            if (!['reset', 'default', 'auto'].includes(lowered) && !nextTimeZone) {
+                await replyHtml(
+                    ctx,
+                    '这个时区格式不正确。请使用 IANA 时区名，例如 <code>Asia/Shanghai</code> 或 <code>America/Los_Angeles</code>。'
+                );
+                return;
+            }
+
+            await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'command:timezone',
+                async (diary) => {
+                    diary.profile.timeZone = nextTimeZone;
+                    diary.markModified('profile');
+                }
+            );
+
+            await sendTimezonePanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'timezone', chatId }, error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
+    });
+
+    bot.command('quiet', async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        const args = getCommandArgs(ctx);
+
+        try {
+            if (!args) {
+                await sendQuietPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+                return;
+            }
+
+            const parsed = parseQuietArgs(args);
+            if (!parsed) {
+                await replyHtml(
+                    ctx,
+                    '格式不正确。请使用 <code>/quiet 23:00-08:00</code>，或使用 <code>/quiet off</code> 关闭免打扰。'
+                );
+                return;
+            }
+
+            await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'command:quiet',
+                async (diary) => {
+                    if (!parsed.enabled) {
+                        diary.profile.quietHoursEnabled = false;
+                        diary.markModified('profile');
+                        return;
+                    }
+
+                    diary.profile.quietHoursEnabled = true;
+                    diary.profile.quietHoursStart = parsed.startMinutes;
+                    diary.profile.quietHoursEnd = parsed.endMinutes;
+                    diary.markModified('profile');
+                }
+            );
+
+            await sendQuietPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'quiet', chatId }, error);
             await replyHtml(ctx, FALLBACK_ERROR_HTML);
         }
     });
@@ -1050,5 +1314,28 @@ module.exports = function setupCommands(bot, openai, diaryService) {
             logRuntimeError({ scope: 'command', operation: 'push_window_action', chatId }, error);
             await ctx.answerCbQuery('刚才没有切成功。', { show_alert: false });
         }
+    });
+
+    bot.hears(/^\/([a-zA-Z0-9_]+)(?:@([\w_]+))?(?:\s|$)/, async (ctx) => {
+        const command = String(ctx.match?.[1] || '').toLowerCase();
+        const targetBot = String(ctx.match?.[2] || '').trim().toLowerCase();
+        const selfBot = String(ctx.botInfo?.username || '').trim().toLowerCase();
+
+        if (targetBot && selfBot && targetBot !== selfBot) {
+            return;
+        }
+
+        if (KNOWN_COMMANDS.has(command)) {
+            return;
+        }
+
+        await replyHtml(
+            ctx,
+            [
+                '<i>*把这条指令按住，先不让它丢*</i>',
+                `我还不认识 <code>/${escapeHtml(command)}</code> 这个命令。`,
+                '你可以发 <code>/help</code> 看完整可用命令。',
+            ].join('\n')
+        );
     });
 };

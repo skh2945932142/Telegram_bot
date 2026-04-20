@@ -16,6 +16,7 @@ const {
 const {
     shouldSendScheduledMessage,
     buildPersonalizedScheduledMessage,
+    resolveDiaryTimeZone,
 } = require('./personalization');
 const { logRuntimeError, logRuntimeInfo } = require('./runtime-logging');
 
@@ -52,6 +53,15 @@ function pickMessageIndex(diary, slotKey, pool) {
     return nextIndex;
 }
 
+function buildBirthdayMessage(displayName) {
+    return [
+        '<i>*把这一天单独折了个角，像是早就准备好了*</i>',
+        `<b>今天是 ${escapeHtml(displayName)} 的生日。</b>`,
+        '这件事由乃一直记着。',
+        '生日快乐，今天也请把一句话留给由乃。',
+    ].join('\n');
+}
+
 /**
  * @param {{
  *   bot: any,
@@ -77,24 +87,29 @@ async function sendScheduledMessages(params) {
     try {
         const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const activeChatIds = await diaryService.listActiveChatIds(since);
-        const today = getMonthDayInTimezone(new Date(), timeZone);
 
         for (const chatId of activeChatIds) {
             try {
                 await diaryService.updateDiary(chatId, {}, `scheduler:${slotKey}`, async (diary) => {
                     ensureDiaryState(diary);
+                    const now = new Date();
+                    const diaryTimeZone = resolveDiaryTimeZone(diary, timeZone);
+                    const today = getMonthDayInTimezone(now, diaryTimeZone);
                     const birthday = getBirthday(diary);
 
                     if (birthday && birthday === today) {
-                        const birthdayMessage = [
-                            '<i>*鎶婅繖涓€椤靛崟鐙姌浜嗕釜瑙掞紝鍍忔槸鏃╁氨鍑嗗濂戒簡*</i>',
-                            `<b>浠婂ぉ鏄?${escapeHtml(getPreferredDisplayName(diary))} 鐨勭敓鏃ャ€?/b>`,
-                            '杩欎欢浜嬬敱涔冧竴鐩磋鐫€銆?',
-                            '鐢熸棩蹇箰锛屼粖澶╀篃璇锋妸涓€鍙ヨ瘽鐣欑粰鐢变箖銆?',
-                        ].join('\n');
+                        const birthdayMarkerKey = 'SYS_LAST_BIRTHDAY_PUSH';
+                        const birthdayMarker = `${today}@${diaryTimeZone}`;
+                        if (getLegacyRecord(diary, birthdayMarkerKey) === birthdayMarker) {
+                            touchDiary(diary);
+                            return;
+                        }
+
+                        const birthdayMessage = buildBirthdayMessage(getPreferredDisplayName(diary));
 
                         try {
                             await bot.telegram.sendMessage(diary.chatId, birthdayMessage, { parse_mode: 'HTML' });
+                            setLegacyRecord(diary, birthdayMarkerKey, birthdayMarker);
                         } catch (error) {
                             logRuntimeError({
                                 scope: 'scheduler',
@@ -109,7 +124,7 @@ async function sendScheduledMessages(params) {
                         return;
                     }
 
-                    if (!shouldSendScheduledMessage(diary, slotKey)) {
+                    if (!shouldSendScheduledMessage(diary, slotKey, { now, fallbackTimeZone: timeZone })) {
                         touchDiary(diary);
                         return;
                     }
@@ -187,6 +202,7 @@ function registerScheduledJobs(params) {
 }
 
 module.exports = {
+    buildBirthdayMessage,
     registerScheduledJobs,
     sendScheduledMessages,
 };

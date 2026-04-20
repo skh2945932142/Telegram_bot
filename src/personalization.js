@@ -5,15 +5,27 @@ const {
     ensureDiaryState,
     getLegacyRecordsMap,
     getPreferredDisplayName,
+    normalizeTimeZone,
+    normalizePushPreference,
 } = require('./state/diary-store');
+
+const DEFAULT_DIARY_TIME_ZONE = 'Asia/Shanghai';
 
 function getAllowedPushWindows(diary) {
     ensureDiaryState(diary);
-    const windows = Array.isArray(diary.profile?.pushWindows)
-        ? diary.profile.pushWindows.filter(Boolean)
-        : [];
+    if (!Array.isArray(diary.profile?.pushWindows)) {
+        return ['morning', 'afternoon', 'night'];
+    }
 
-    return windows.length > 0 ? windows : ['morning', 'afternoon', 'night'];
+    const windows = new Set(
+        diary.profile.pushWindows.filter((value) => ['morning', 'afternoon', 'night'].includes(value))
+    );
+
+    const normalized = ['morning', 'afternoon', 'night'].filter((value) => windows.has(value));
+    if (normalized.length === 0 && !diary.profile?.pushWindowsConfigured) {
+        return ['morning', 'afternoon', 'night'];
+    }
+    return normalized;
 }
 
 function getLatestFollowUpContext(diary) {
@@ -48,12 +60,62 @@ function getLatestFollowUpContext(diary) {
     return latestUserTurn ? String(latestUserTurn.content).trim() : '';
 }
 
-function shouldSendScheduledMessage(diary, slotKey) {
+function resolveDiaryTimeZone(diary, fallbackTimeZone = DEFAULT_DIARY_TIME_ZONE) {
+    ensureDiaryState(diary);
+    return normalizeTimeZone(diary.profile?.timeZone) || fallbackTimeZone;
+}
+
+function getMinutesInTimezone(date, timeZone) {
+    const formatter = new Intl.DateTimeFormat('en-GB', {
+        timeZone,
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+    });
+    const parts = formatter.formatToParts(date);
+    const hour = Number(parts.find((part) => part.type === 'hour')?.value || 0);
+    const minute = Number(parts.find((part) => part.type === 'minute')?.value || 0);
+    return (hour * 60) + minute;
+}
+
+function isWithinQuietHours(diary, options = {}) {
+    ensureDiaryState(diary);
+    const enabled = Boolean(diary.profile?.quietHoursEnabled);
+    if (!enabled) {
+        return false;
+    }
+
+    const start = Number(diary.profile?.quietHoursStart);
+    const end = Number(diary.profile?.quietHoursEnd);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+        return false;
+    }
+
+    const now = options.now instanceof Date ? options.now : new Date();
+    const fallbackTimeZone = options.fallbackTimeZone || DEFAULT_DIARY_TIME_ZONE;
+    const timeZone = resolveDiaryTimeZone(diary, fallbackTimeZone);
+    const nowMinutes = getMinutesInTimezone(now, timeZone);
+
+    if (start === end) {
+        return true;
+    }
+
+    if (start < end) {
+        return nowMinutes >= start && nowMinutes < end;
+    }
+    return nowMinutes >= start || nowMinutes < end;
+}
+
+function shouldSendScheduledMessage(diary, slotKey, options = {}) {
     ensureDiaryState(diary);
 
-    const preference = String(diary.profile?.pushPreference || '');
+    const preference = normalizePushPreference(diary.profile?.pushPreference || '');
     const allowedWindows = getAllowedPushWindows(diary);
     if (!allowedWindows.includes(slotKey)) {
+        return false;
+    }
+
+    if (isWithinQuietHours(diary, options)) {
         return false;
     }
 
@@ -79,7 +141,7 @@ function buildPersonalizedScheduledMessage(diary, slotKey, baseMessage) {
     const interests = Array.isArray(diary.profile?.interests) ? diary.profile.interests.filter(Boolean) : [];
     const emojis = Array.isArray(diary.profile?.commonEmoji) ? diary.profile.commonEmoji.filter(Boolean) : [];
     const greetingStyle = String(diary.profile?.greetingStyle || '').trim();
-    const pushPreference = String(diary.profile?.pushPreference || '').trim();
+    const pushPreference = normalizePushPreference(diary.profile?.pushPreference || '');
     const followUpContext = trimFollowUpContext(getLatestFollowUpContext(diary));
 
     const tails = [];
@@ -121,6 +183,8 @@ function buildPersonalizedScheduledMessage(diary, slotKey, baseMessage) {
 module.exports = {
     getAllowedPushWindows,
     getLatestFollowUpContext,
+    resolveDiaryTimeZone,
+    isWithinQuietHours,
     shouldSendScheduledMessage,
     buildPersonalizedScheduledMessage,
 };
