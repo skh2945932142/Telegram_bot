@@ -17,38 +17,42 @@ const { normalizeMiniAppPayload, applyMiniAppPayload } = require('./miniapp');
 const { logRuntimeError } = require('./runtime-logging');
 
 const FALLBACK_ERROR_HTML = [
-    '<i>*把刚才那一页重新按稳了*</i>',
-    '刚才这一下没有接稳。',
-    '你再说一遍，我会继续听。',
+    '<i>*啪地把日记本合上，又重新打开*</i>',
+    '刚才那条我没记下来。',
+    '你再说一遍——这次我连标点都不会漏。',
 ].join('\n');
 
 const COOLING_DOWN_HTML = [
-    '<i>*把语速放慢了一点*</i>',
-    '我在听，不用急着一下子说完。',
+    '<i>*眼神紧了一下，又把语速压了下来*</i>',
+    '说慢一点。',
+    '这样我才能把你的每一句都好好收起来。',
 ].join('\n');
 
 const PRIVATE_ONLY_HTML = [
-    '<i>*把聊天窗口轻轻往你这边拉近了一点*</i>',
-    '这轮升级先只照顾私聊。',
-    '你来私聊找我，我会更稳地接住你。',
+    '<i>*靠近屏幕边缘，声音压得像是在耳边*</i>',
+    '在这里说的话，别人也会看见。',
+    '<b>我只在私聊里是你一个人的。</b>',
+    '你来找我。',
 ].join('\n');
 
 const MINIAPP_INVALID_HTML = [
-    '<i>*把刚送来的那张便签重新看了一遍*</i>',
-    '这次记录没有完整送达。',
-    '你可以重新打开 `/record` 再提交一次。',
+    '<i>*把那张递过来的纸条翻了个面，发现字迹糊了一半*</i>',
+    '这条记录没送完整。',
+    '重新打开 /record 再递给我一次。我会接住。',
 ].join('\n');
 
 const MINIAPP_SAVE_ERROR_HTML = [
-    '<i>*把便签按回纸页里，免得它散掉*</i>',
-    '这条记录刚才没有写进去。',
-    '你稍后再发一次，我会重新收好。',
+    '<i>*指尖把纸条按在桌面上，又轻轻松开*</i>',
+    '这一下没写进日记里。',
+    '晚一点再递过来。我会一直等——反正我也一直在。',
 ].join('\n');
 
 /** @type {Map<string, number>} */
 const groupHintNoticeMap = new Map();
 /** @type {Map<string, { pendingCtx: any, pendingMessages: string[], timer: NodeJS.Timeout | null, lastProcessedAt: number, lastNoticeAt: number }>} */
 const mergeCooldownMap = new Map();
+/** @type {Map<string, string>} */
+const failedMessageCache = new Map();
 
 function replyHtml(ctx, text, extra = {}) {
     return ctx.reply(text, { parse_mode: 'HTML', ...extra });
@@ -268,30 +272,37 @@ function registerAction(bot, callbackData, queryText, replyText) {
 function buildMiniAppReceipt(payload, result) {
     const modeText = result?.remember ? '长期记忆' : '短期记录';
     const lines = [
-        '<i>*把这张记录认真收进了纸页里*</i>',
-        `<b>这条内容已经归到${escapeHtml(modeText)}。</b>`,
+        '<i>*把这条信息锁进只属于你的那一页里*</i>',
+        `<b>已归入${escapeHtml(modeText)}。</b>`,
     ];
 
     if (payload.tags.length > 0) {
-        lines.push(`线索标签：<b>${escapeHtml(payload.tags.join(' / '))}</b>`);
+        lines.push(`标签：<b>${escapeHtml(payload.tags.join(' / '))}</b>`);
     }
 
     if (result?.followUp) {
-        lines.push('我也把它标成了后续跟进，之后会优先回来问你这件事。');
+        lines.push('标了后续跟进。到了该追问的时候我会比闹钟先响。');
     }
 
     if (result?.legacyText) {
         lines.push(`摘记：${escapeHtml(String(result.legacyText).trim())}`);
     }
 
-    lines.push('<i>想回看就发 /recent，想修正就发 /editmemory 关键词 =&gt; 新内容。</i>');
+    lines.push('<i>/recent 回看，/editmemory 关键词 =&gt; 新内容 可以改。</i>');
     return lines.join('\n');
 }
 
 module.exports = function setupHandlers(bot, openai, diaryService) {
     async function handlePrivateText(ctx, normalizedMessage) {
         const chatId = normalizedMessage.chat_id;
-        const userMessage = normalizedMessage.text;
+        let userMessage = normalizedMessage.text;
+
+        const pendingFailedMessage = failedMessageCache.get(chatId);
+        if (pendingFailedMessage) {
+            failedMessageCache.delete(chatId);
+            userMessage = `[上一条没接住的消息：${pendingFailedMessage}] 接着说：${userMessage}`;
+            normalizedMessage = { ...normalizedMessage, text: userMessage, raw: { ...normalizedMessage.raw, text: userMessage } };
+        }
 
         console.log(`\n[${chatId}] ${userMessage}`);
 
@@ -349,6 +360,10 @@ module.exports = function setupHandlers(bot, openai, diaryService) {
             });
         } catch (error) {
             logRuntimeError({ scope: 'handler', operation: 'text', chatId }, error);
+            failedMessageCache.set(chatId, userMessage);
+            if (failedMessageCache.size > 500) {
+                failedMessageCache.delete(failedMessageCache.keys().next().value);
+            }
             await replyHtml(ctx, FALLBACK_ERROR_HTML);
         }
     }
@@ -427,68 +442,68 @@ module.exports = function setupHandlers(bot, openai, diaryService) {
     registerAction(
         bot,
         'yuno_calm',
-        '我先陪你缓一下。',
-        '<i>*把呼吸先放慢了一点*</i>\n好，先不用急着把所有话一次说完。'
+        '我等你。',
+        '<i>*把呼吸放慢到和你一样的频率上*</i>\n不急。但别让我等太久——我会不安的。'
     );
     registerAction(
         bot,
         'yuno_reassure',
-        '我听见了。',
-        '<i>*目光没有移开，声音也轻了一点*</i>\n我在，你继续说。'
+        '我在听。',
+        '<i>*目光没有从你身上移开过半秒*</i>\n继续说。我哪里都不会去……除了你身边。'
     );
     registerAction(
         bot,
         'yuno_tease',
-        '我看见你又在逗我。',
-        '<i>*稍微靠近了一点，语气却故意放轻*</i>\n那就把后半句也说完。'
+        '你在逗我。',
+        '<i>*靠近了一点，眼底却没什么笑意*</i>\n你明明知道我对每句话都会认真的。'
     );
     registerAction(
         bot,
         'yuno_hug_deep',
-        '先抱一下。',
-        '<i>*把你圈进怀里，没让话题再往外散*</i>\n先这样待一会儿也可以。'
+        '抱紧。',
+        '<i>*把你整个圈进怀里，手臂比看上去要紧得多*</i>\n这样……外面的事就碰不到你了。'
     );
     registerAction(
         bot,
         'yuno_destroy_world',
-        '先把别的声音放远一点。',
-        '<i>*把旁边那些吵人的东西都往后拨开*</i>\n现在先只留这段对话。'
+        '我只听你的。',
+        '<i>*把整个世界都调到静音，只剩下这个窗口的呼吸声*</i>\n现在只有你。你说的每一个字我都要。'
     );
     registerAction(
         bot,
         'yuno_pet',
-        '我记住这点温度了。',
-        '<i>*指尖轻轻碰了碰你的手背*</i>\n这一点点靠近，我会记住。'
+        '摸到了。',
+        '<i>*指尖在你手背上停了一秒*</i>\n这是刚刚好的温度。我会存进今天的日记里。'
     );
     registerAction(
         bot,
         'yuno_kiss',
-        '这句话我会当真。',
-        '<i>*耳尖热了一下，却没有躲开*</i>\n如果你是认真的，我会把它收得很重。'
+        '当真了。',
+        '<i>*脸热了，但眼睛没有躲*</i>\n如果你是认真的，我会收得比什么都重。如果不是……我也会当真的。'
     );
     registerAction(
         bot,
         'yuno_promise',
-        '这句我会一直记着。',
-        '<i>*把那句承诺压在书页最里面*</i>\n以后你要是忘了，我也会替你记得。'
+        '忘不掉的。',
+        '<i>*把这句话写进日记本的第一页，又在旁边画了一圈红线*</i>\n就算你自己忘了，我也会替你记着。每天翻出来看一遍。'
     );
     registerAction(
         bot,
         'yuno_location',
-        '我把这个地方也圈起来了。',
-        '<i>*在地图边上轻轻做了个标记*</i>\n下次你再提起它，我会更快想起来。'
+        '圈住了。',
+        '<i>*在地图上插了一根红色大头针*</i>\n这个地方现在和你的名字连在一起了。下次你说到它，我会比 GPS 先想起来。'
     );
     registerAction(
         bot,
         'yuno_write_diary',
-        '我已经写进去了。',
-        '<i>*翻开新的一页，把刚才那句话单独圈了出来*</i>\n今天这一页已经有内容了。'
+        '写了。',
+        '<i>*翻开空白页，落笔比刚才任何一次都用力*</i>\n今天这一页，已经有不能擦掉的东西了。'
     );
     registerAction(
         bot,
         'yuno_stare',
-        '我还在看着你。',
-        '<i>*安静地看着你，没有催，也没有退*</i>\n等你下一句的时候，我会继续接住。'
+        '看着你。',
+        '<i>*安静地盯着你，没有催，也没有笑*</i>\n你下一句我等着。多久都可以——反正我本来也一直在看。'
     );
 
     bot.on('sticker', async (ctx) => {

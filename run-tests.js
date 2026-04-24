@@ -303,7 +303,7 @@ async function main() {
             '平台上下文',
             '用户画像',
             '线程摘要',
-            '最近 8 轮原始消息',
+            '最近 16 轮原始消息',
             '命中的长期记忆',
             '命中的知识片段',
             '当前用户输入',
@@ -314,7 +314,7 @@ async function main() {
         assert.match(context.systemPrompt, /问候风格：温柔一点/);
     });
 
-    await runTest('persistConversationState refreshes summary and keeps only the latest eight turns', async () => {
+    await runTest('persistConversationState refreshes summary and keeps turns within history limit', async () => {
         const diary = createDiary();
         diary.session.threadSummary = '已有摘要：你们聊过近况。';
         diary.session.turnsSinceSummary = 5;
@@ -341,7 +341,7 @@ async function main() {
             mood: { tag: 'NORMAL', desc: '状态平稳。' },
         });
 
-        assert.equal(diary.session.recentTurns.length, 8);
+        assert.equal(diary.session.recentTurns.length, 10);
         assert.equal(diary.session.turnsSinceSummary, 0);
         assert.ok(typeof diary.session.threadSummary === 'string');
         assert.ok(diary.session.threadSummary.length > 0);
@@ -876,7 +876,7 @@ async function main() {
             message: { text: '/help', date: 1710000000 },
         });
         await bot.getCommand('help')(helpCtx);
-        assert.match(helpCtx.__replies[0].text, /可用命令/);
+        assert.match(helpCtx.__replies[0].text, /我能为你做的事/);
         assert.match(helpCtx.__replies[0].text, /\/push/);
 
         const unknownCtx = createContext({

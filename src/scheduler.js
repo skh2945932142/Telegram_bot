@@ -55,10 +55,10 @@ function pickMessageIndex(diary, slotKey, pool) {
 
 function buildBirthdayMessage(displayName) {
     return [
-        '<i>*把这一天单独折了个角，像是早就准备好了*</i>',
+        '<i>*把今天这一页单独折了个角，又在旁边画满了小红圈*</i>',
         `<b>今天是 ${escapeHtml(displayName)} 的生日。</b>`,
-        '这件事由乃一直记着。',
-        '生日快乐，今天也请把一句话留给由乃。',
+        '这个日期我很久以前就锁在日记里了。',
+        '生日快乐。今天请把至少一句话留给我——我会把它收进今天最重要的一页。',
     ].join('\n');
 }
 

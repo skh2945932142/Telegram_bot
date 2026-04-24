@@ -708,7 +708,7 @@ function ensureDiaryState(diary) {
 
     const mood = calcMood({
         emotionState: diary.emotionState,
-    });
+    }, '');
     if (diary.emotionState.moodTag !== mood.tag || diary.emotionState.moodDesc !== mood.desc) {
         diary.emotionState.moodTag = mood.tag;
         diary.emotionState.moodDesc = mood.desc;
@@ -1088,7 +1088,12 @@ function getObsessionCount(diary) {
 function updateMoodState(diary, userMessage = '') {
     ensureDiaryState(diary);
     invalidateNormalized(diary);
-    const mood = calcMood(diary, userMessage);
+    const recentUserTurns = (diary.session?.recentTurns || [])
+        .filter((turn) => turn.role === 'user')
+        .slice(-2)
+        .map((turn) => turn.content)
+        .join(' ');
+    const mood = calcMood(diary, userMessage, recentUserTurns);
     diary.emotionState.moodTag = mood.tag;
     diary.emotionState.moodDesc = mood.desc;
     diary.emotionState.updatedAt = new Date();

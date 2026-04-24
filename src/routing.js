@@ -44,10 +44,15 @@ const MEMORY_PATTERNS = [
     /(角色扮演|设定里|长期设定|记住这个设定)/u,
 ];
 
+function getCurrentMoodTag(diary) {
+    return String(diary?.emotionState?.moodTag || '').trim();
+}
+
 function decideRoute(normalizedMessage, diary) {
     const text = String(normalizedMessage?.text || '').trim();
     const recentTurns = diary?.session?.recentTurns || [];
     const hasHistory = recentTurns.length > 0 || Boolean(diary?.session?.threadSummary);
+    const currentMood = getCurrentMoodTag(diary);
 
     let type = ROUTE_TYPES.GENERAL_CHAT;
 
@@ -58,7 +63,11 @@ function decideRoute(normalizedMessage, diary) {
     } else if (SAFETY_CRISIS_PATTERNS.some((pattern) => pattern.test(text))) {
         type = ROUTE_TYPES.SAFETY_CRISIS;
     } else if (EMOTION_PATTERNS.some((pattern) => pattern.test(text))) {
-        type = ROUTE_TYPES.EMOTION_SUPPORT;
+        if (['LOVE', 'TENDER'].includes(currentMood)) {
+            type = ROUTE_TYPES.GENERAL_CHAT;
+        } else {
+            type = ROUTE_TYPES.EMOTION_SUPPORT;
+        }
     } else if (MEMORY_PATTERNS.some((pattern) => pattern.test(text)) && !/[?？]/u.test(text)) {
         type = ROUTE_TYPES.MEMORY_UPDATE_ONLY;
     } else if (hasHistory && (FOLLOW_UP_PATTERNS.some((pattern) => pattern.test(text)) || text.length <= 10)) {
