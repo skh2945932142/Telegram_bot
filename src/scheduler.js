@@ -16,9 +16,19 @@ const {
 const {
     shouldSendScheduledMessage,
     buildPersonalizedScheduledMessage,
+    getAllowedPushWindows,
+    isWithinQuietHours,
     resolveDiaryTimeZone,
 } = require('./personalization');
 const { logRuntimeError, logRuntimeInfo } = require('./runtime-logging');
+const {
+    WEEKLY_REVIEW_MARKER_KEY,
+    buildWeeklyReviewMarker,
+    buildWeeklyReviewPushKeyboard,
+    buildWeeklyReviewPushText,
+    isSundayNightReviewWindow,
+    isWeeklyReviewEnabled,
+} = require('./review');
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -178,6 +188,102 @@ async function sendScheduledMessages(params) {
  *   bot: any,
  *   diaryService: ReturnType<typeof import('./diary-service').createDiaryService>,
  *   timeZone: string,
+ *   now?: Date,
+ * }} params
+ */
+async function sendWeeklyReviewDigests(params) {
+    const {
+        bot,
+        diaryService,
+        timeZone,
+        now = new Date(),
+    } = params;
+
+    try {
+        const since = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        const activeChatIds = await diaryService.listActiveChatIds(since);
+
+        for (const chatId of activeChatIds) {
+            try {
+                await diaryService.updateDiary(chatId, {}, 'scheduler:weekly_review', async (diary) => {
+                    ensureDiaryState(diary);
+                    const diaryTimeZone = resolveDiaryTimeZone(diary, timeZone);
+
+                    if (!isSundayNightReviewWindow(now, diaryTimeZone)) {
+                        touchDiary(diary);
+                        return;
+                    }
+
+                    if (!isWeeklyReviewEnabled(diary)) {
+                        touchDiary(diary);
+                        return;
+                    }
+
+                    if (getAllowedPushWindows(diary).length === 0) {
+                        touchDiary(diary);
+                        return;
+                    }
+
+                    if (isWithinQuietHours(diary, { now, fallbackTimeZone: timeZone })) {
+                        touchDiary(diary);
+                        return;
+                    }
+
+                    const marker = buildWeeklyReviewMarker(now, diaryTimeZone);
+                    if (getLegacyRecord(diary, WEEKLY_REVIEW_MARKER_KEY) === marker) {
+                        touchDiary(diary);
+                        return;
+                    }
+
+                    const message = buildWeeklyReviewPushText(diary, { now });
+                    const keyboard = buildWeeklyReviewPushKeyboard(diary);
+
+                    try {
+                        await bot.telegram.sendMessage(diary.chatId, message, {
+                            parse_mode: 'HTML',
+                            reply_markup: {
+                                inline_keyboard: keyboard,
+                            },
+                        });
+                        setLegacyRecord(diary, WEEKLY_REVIEW_MARKER_KEY, marker);
+                    } catch (error) {
+                        logRuntimeError({
+                            scope: 'scheduler',
+                            operation: 'send_weekly_review',
+                            chatId,
+                        }, error);
+                    }
+
+                    touchDiary(diary);
+                });
+            } catch (error) {
+                logRuntimeError({
+                    scope: 'scheduler',
+                    operation: 'persist_weekly_review',
+                    chatId,
+                }, error);
+            }
+
+            await sleep(120);
+        }
+
+        logRuntimeInfo(
+            { scope: 'scheduler', operation: 'complete:weekly_review', extra: { count: activeChatIds.length } },
+            'Weekly review push complete.'
+        );
+    } catch (error) {
+        logRuntimeError({
+            scope: 'scheduler',
+            operation: 'crash:weekly_review',
+        }, error);
+    }
+}
+
+/**
+ * @param {{
+ *   bot: any,
+ *   diaryService: ReturnType<typeof import('./diary-service').createDiaryService>,
+ *   timeZone: string,
  *   jobs: Array<{ cron: string, slotKey: string, baseMessages: string[], guardedMessages: string[], sweetMessages: string[] }>
  * }} params
  */
@@ -199,10 +305,21 @@ function registerScheduledJobs(params) {
             { timezone: timeZone }
         );
     }
+
+    cron.schedule(
+        '0 * * * *',
+        () => sendWeeklyReviewDigests({
+            bot,
+            diaryService,
+            timeZone,
+        }),
+        { timezone: timeZone }
+    );
 }
 
 module.exports = {
     buildBirthdayMessage,
     registerScheduledJobs,
     sendScheduledMessages,
+    sendWeeklyReviewDigests,
 };

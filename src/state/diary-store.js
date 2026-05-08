@@ -939,6 +939,23 @@ function upsertLongTermMemory(diary, memory) {
 
 /**
  * @param {any} diary
+ */
+function sortAndTrimLongTermMemories(diary) {
+    diary.longTermMemories = (diary.longTermMemories || [])
+        .map(normalizeMemory)
+        .filter(Boolean)
+        .sort((left, right) => {
+            const leftScore = new Date(left.lastConfirmed).getTime() + left.weight * 1000;
+            const rightScore = new Date(right.lastConfirmed).getTime() + right.weight * 1000;
+            return rightScore - leftScore;
+        })
+        .slice(0, LONG_TERM_MEMORY_LIMIT);
+
+    diary.markModified('longTermMemories');
+}
+
+/**
+ * @param {any} diary
  * @param {string} query
  */
 function findLongTermMemoryMatches(diary, query) {
@@ -984,6 +1001,37 @@ function removeLongTermMemory(diary, query) {
 
 /**
  * @param {any} diary
+ * @param {string} key
+ */
+function removeLongTermMemoryByKey(diary, key) {
+    ensureDiaryState(diary);
+    invalidateNormalized(diary);
+
+    const memoryKey = String(key || '').trim();
+    if (!memoryKey) {
+        return null;
+    }
+
+    const selectedIndex = (diary.longTermMemories || []).findIndex((memory) => {
+        const normalized = normalizeMemory(memory);
+        return normalized && normalized.key === memoryKey;
+    });
+
+    if (selectedIndex < 0) {
+        return null;
+    }
+
+    const selected = normalizeMemory(diary.longTermMemories[selectedIndex]);
+    diary.longTermMemories.splice(selectedIndex, 1);
+    if (selected?.key) {
+        deleteLegacyRecord(diary, selected.key);
+    }
+    diary.markModified('longTermMemories');
+    return selected;
+}
+
+/**
+ * @param {any} diary
  * @param {string} query
  * @param {string} nextValue
  */
@@ -1013,6 +1061,93 @@ function updateLongTermMemoryValue(diary, query, nextValue) {
         setLegacyRecord(diary, updatedMemory.key, normalizedValue);
     }
     diary.markModified('longTermMemories');
+    return normalizeMemory(updatedMemory);
+}
+
+/**
+ * @param {any} diary
+ * @param {string} key
+ * @param {string} nextValue
+ * @param {{ source?: string }} [options]
+ */
+function updateLongTermMemoryByKey(diary, key, nextValue, options = {}) {
+    ensureDiaryState(diary);
+    invalidateNormalized(diary);
+
+    const memoryKey = String(key || '').trim();
+    const normalizedValue = stripToPlainText(nextValue);
+    if (!memoryKey || !normalizedValue) {
+        return null;
+    }
+
+    const selectedIndex = (diary.longTermMemories || []).findIndex((memory) => {
+        const normalized = normalizeMemory(memory);
+        return normalized && normalized.key === memoryKey;
+    });
+
+    if (selectedIndex < 0) {
+        return null;
+    }
+
+    const previous = normalizeMemory(diary.longTermMemories[selectedIndex]);
+    if (!previous) {
+        return null;
+    }
+
+    const updatedMemory = {
+        ...previous,
+        value: normalizedValue,
+        lastConfirmed: new Date(),
+        source: String(options.source || 'user-edit'),
+    };
+    diary.longTermMemories[selectedIndex] = updatedMemory;
+    if (updatedMemory.key) {
+        setLegacyRecord(diary, updatedMemory.key, normalizedValue);
+    }
+    sortAndTrimLongTermMemories(diary);
+    return normalizeMemory(updatedMemory);
+}
+
+/**
+ * @param {any} diary
+ * @param {string} key
+ * @param {{ minWeight?: number }} [options]
+ */
+function confirmLongTermMemoryByKey(diary, key, options = {}) {
+    ensureDiaryState(diary);
+    invalidateNormalized(diary);
+
+    const memoryKey = String(key || '').trim();
+    if (!memoryKey) {
+        return null;
+    }
+
+    const selectedIndex = (diary.longTermMemories || []).findIndex((memory) => {
+        const normalized = normalizeMemory(memory);
+        return normalized && normalized.key === memoryKey;
+    });
+
+    if (selectedIndex < 0) {
+        return null;
+    }
+
+    const previous = normalizeMemory(diary.longTermMemories[selectedIndex]);
+    if (!previous) {
+        return null;
+    }
+
+    const minWeight = Number(options.minWeight);
+    const updatedMemory = {
+        ...previous,
+        weight: clamp(Math.max(previous.weight, Number.isFinite(minWeight) ? minWeight : 0.85), 0.1, 1),
+        source: 'user-confirm',
+        lastConfirmed: new Date(),
+    };
+    diary.longTermMemories[selectedIndex] = updatedMemory;
+    if (updatedMemory.key) {
+        setLegacyRecord(diary, updatedMemory.key, updatedMemory.value);
+    }
+    sortAndTrimLongTermMemories(diary);
     return normalizeMemory(updatedMemory);
 }
 
@@ -1369,7 +1504,10 @@ module.exports = {
     upsertLongTermMemory,
     findLongTermMemoryMatches,
     removeLongTermMemory,
+    removeLongTermMemoryByKey,
     updateLongTermMemoryValue,
+    updateLongTermMemoryByKey,
+    confirmLongTermMemoryByKey,
     applyMemoryUpdates,
     recordObsession,
     getObsessionCount,

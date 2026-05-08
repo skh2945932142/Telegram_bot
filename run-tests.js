@@ -21,7 +21,7 @@ const { createDiaryService } = require('./src/diary-service');
 const { normalizeMiniAppPayload, applyMiniAppPayload } = require('./src/miniapp');
 const setupCommands = require('./src/commands');
 const setupHandlers = require('./src/handlers');
-const { buildBirthdayMessage } = require('./src/scheduler');
+const { buildBirthdayMessage, sendWeeklyReviewDigests } = require('./src/scheduler');
 const {
     appendRecentTurn,
     ensureDiaryState,
@@ -34,6 +34,10 @@ const {
     shouldSendScheduledMessage,
 } = require('./src/personalization');
 const { getEnabledPushWindows } = require('./src/user-preferences');
+const {
+    getMemoryReviewSession,
+    getPendingMemoryEdit,
+} = require('./src/review');
 
 let failures = 0;
 
@@ -107,6 +111,7 @@ function createBotDouble() {
     const commands = new Map();
     const actions = [];
     const hearRules = [];
+    const sentMessages = [];
     /** @type {Map<string, Array<(ctx: any) => Promise<void> | void>>} */
     const eventHandlers = new Map();
     let startHandler = null;
@@ -120,6 +125,12 @@ function createBotDouble() {
         },
         action(trigger, handler) {
             actions.push({ trigger, handler });
+        },
+        telegram: {
+            async sendMessage(chatId, text, options = {}) {
+                sentMessages.push({ chatId, text, options });
+                return { chatId, text, options };
+            },
         },
         hears(trigger, handler) {
             hearRules.push({ trigger, handler });
@@ -179,6 +190,7 @@ function createBotDouble() {
 
             return false;
         },
+        __sentMessages: sentMessages,
     };
 }
 
@@ -265,6 +277,41 @@ async function main() {
         assert.match(response.text, /安全|紧急|急诊/);
     });
 
+    await runTest('orchestrateMessage adds route-aware quick action rows for cold start and emotion support', async () => {
+        const coldDiary = createDiary();
+        const coldResponse = await orchestrateMessage({
+            openai: null,
+            diary: coldDiary,
+            normalizedMessage: {
+                platform: 'telegram',
+                chat_type: 'private',
+                chat_id: 'cold-route-chat',
+                text: '无聊',
+                timestamp: 1710000000,
+            },
+        });
+        const coldCallbacks = coldResponse.keyboard.flat().map((button) => button.callback_data);
+        assert.ok(coldCallbacks.includes('yuno_pick_topic'));
+        assert.ok(coldCallbacks.includes('yuno_worst_today'));
+
+        const emotionDiary = createDiary();
+        const emotionResponse = await orchestrateMessage({
+            openai: null,
+            diary: emotionDiary,
+            normalizedMessage: {
+                platform: 'telegram',
+                chat_type: 'private',
+                chat_id: 'emotion-route-chat',
+                text: '我今天真的很难受',
+                timestamp: 1710000000,
+            },
+        });
+        const emotionCallbacks = emotionResponse.keyboard.flat().map((button) => button.callback_data);
+        assert.ok(emotionCallbacks.includes('yuno_hide_here'));
+        assert.ok(emotionCallbacks.includes('yuno_tell_all'));
+        assert.ok(emotionCallbacks.includes('support_mode_companion'));
+    });
+
     await runTest('buildConversationContext keeps the section order stable', async () => {
         const diary = createDiary({
             profile: {
@@ -298,20 +345,22 @@ async function main() {
         });
 
         const titles = context.sections.map((section) => section.title);
-        assert.deepEqual(titles.slice(0, 8), [
+        assert.deepEqual(titles.slice(0, 9), [
             '系统人格设定',
             '平台上下文',
             '用户画像',
+            '关系温度',
             '线程摘要',
             '最近 16 轮原始消息',
             '命中的长期记忆',
             '命中的知识片段',
             '当前用户输入',
         ]);
-        assert.match(context.systemPrompt, /### 系统人格设定[\s\S]*### 平台上下文[\s\S]*### 用户画像/);
+        assert.match(context.systemPrompt, /### 系统人格设定[\s\S]*### 平台上下文[\s\S]*### 用户画像[\s\S]*### 关系温度/);
         assert.match(context.systemPrompt, /兴趣偏好：抹茶拿铁、动画/);
         assert.match(context.systemPrompt, /常用表情：✨ 🤍/);
         assert.match(context.systemPrompt, /问候风格：温柔一点/);
+        assert.match(context.systemPrompt, /当前关系温度：/);
     });
 
     await runTest('persistConversationState refreshes summary and keeps turns within history limit', async () => {
@@ -345,6 +394,24 @@ async function main() {
         assert.equal(diary.session.turnsSinceSummary, 0);
         assert.ok(typeof diary.session.threadSummary === 'string');
         assert.ok(diary.session.threadSummary.length > 0);
+    });
+
+    await runTest('orchestrateMessage memory feedback points users to review and memory panels', async () => {
+        const diary = createDiary();
+        const response = await orchestrateMessage({
+            openai: null,
+            diary,
+            normalizedMessage: {
+                platform: 'telegram',
+                chat_type: 'private',
+                chat_id: 'memory-feedback-chat',
+                text: '以后叫我阿澈',
+                timestamp: 1710000000,
+            },
+        });
+
+        assert.match(response.text, /\/review/);
+        assert.match(response.text, /\/memory/);
     });
 
     await runTest('extractStableMemoriesHeuristically ignores temporary emotions and keeps stable preferences', async () => {
@@ -692,6 +759,81 @@ async function main() {
         assert.equal(shouldSendScheduledMessage(diary, 'morning', { now: outQuiet, fallbackTimeZone: 'Asia/Shanghai' }), true);
     });
 
+    await runTest('weekly review scheduler sends once on Sunday night for active users', async () => {
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+
+        const diary = createDiary({
+            chatId: 'weekly-review-chat',
+            lastActiveAt: new Date('2026-05-08T09:00:00.000Z'),
+        });
+        diary.profile.timeZone = 'Asia/Shanghai';
+        diary.profile.pushWindowsConfigured = true;
+        diary.profile.pushWindows = ['night'];
+        diary.session.threadSummary = '这周你一直在收尾工作，也一直怕自己收不住。';
+        upsertLongTermMemory(diary, {
+            category: 'event',
+            key: 'event_deadline',
+            value: '你这周一直在赶收尾截止线',
+            source: 'model-extractor',
+            weight: 0.52,
+            lastConfirmed: new Date('2026-05-09T10:00:00.000Z'),
+        });
+        store.set('weekly-review-chat', diary);
+
+        const reviewTime = new Date('2026-05-10T12:30:00.000Z'); // Sunday 20:30 Asia/Shanghai
+        await sendWeeklyReviewDigests({
+            bot,
+            diaryService: service,
+            timeZone: 'UTC',
+            now: reviewTime,
+        });
+        assert.equal(bot.__sentMessages.length, 1);
+        assert.match(bot.__sentMessages[0].text, /这周我替你收住了这些/);
+
+        await sendWeeklyReviewDigests({
+            bot,
+            diaryService: service,
+            timeZone: 'UTC',
+            now: reviewTime,
+        });
+        assert.equal(bot.__sentMessages.length, 1);
+    });
+
+    await runTest('weekly review scheduler skips quiet-hours users and does not spill into Monday', async () => {
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+
+        const diary = createDiary({
+            chatId: 'weekly-review-quiet-chat',
+            lastActiveAt: new Date('2026-05-08T09:00:00.000Z'),
+        });
+        diary.profile.timeZone = 'Asia/Shanghai';
+        diary.profile.pushWindowsConfigured = true;
+        diary.profile.pushWindows = ['night'];
+        diary.profile.quietHoursEnabled = true;
+        diary.profile.quietHoursStart = 18 * 60;
+        diary.profile.quietHoursEnd = 8 * 60;
+        diary.session.threadSummary = '这周你提了好几次要早点收线。';
+        store.set('weekly-review-quiet-chat', diary);
+
+        await sendWeeklyReviewDigests({
+            bot,
+            diaryService: service,
+            timeZone: 'UTC',
+            now: new Date('2026-05-10T15:30:00.000Z'), // Sunday 23:30 Asia/Shanghai
+        });
+        assert.equal(bot.__sentMessages.length, 0);
+
+        await sendWeeklyReviewDigests({
+            bot,
+            diaryService: service,
+            timeZone: 'UTC',
+            now: new Date('2026-05-10T16:30:00.000Z'), // Monday 00:30 Asia/Shanghai
+        });
+        assert.equal(bot.__sentMessages.length, 0);
+    });
+
     await runTest('persistConversationState rolls long summaries into chapter summaries on topic shift', async () => {
         const diary = createDiary();
         diary.session.threadSummary = '你们已经围绕抹茶拿铁和动画聊了很久。'.repeat(14);
@@ -865,6 +1007,244 @@ async function main() {
                 process.env.TELEGRAM_WEBAPP_URL = originalUrl;
             }
         }
+    });
+
+    await runTest('/review command shows empty-state guidance and buttons', async () => {
+        const { service } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+
+        const ctx = createContext({
+            message: { text: '/review', date: 1710000000, message_id: 1 },
+        });
+        await bot.getCommand('review')(ctx);
+
+        assert.match(ctx.__replies[0].text, /这一周的回看/);
+        assert.match(ctx.__replies[0].text, /下次我就能把它们整理成一页给你/);
+        const keyboard = ctx.__replies[0].options.reply_markup.inline_keyboard;
+        assert.equal(keyboard[0][0].callback_data, 'review_start');
+        assert.equal(keyboard[1][1].callback_data, 'review_toggle_weekly');
+    });
+
+    await runTest('/review command renders summary, follow-up, and suggested verification blocks', async () => {
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+        const now = Date.now();
+
+        const diary = createDiary({
+            chatId: 'review-panel-chat',
+            nickname: '阿澄',
+        });
+        diary.session.threadSummary = '这周你一直在赶论文，也反复担心自己会不会来不及。';
+        upsertLongTermMemory(diary, {
+            category: 'event',
+            key: 'event_论文',
+            value: '你在赶论文',
+            source: 'model-extractor',
+            weight: 0.58,
+            lastConfirmed: new Date(now - 12 * 60 * 60 * 1000),
+        });
+        upsertLongTermMemory(diary, {
+            category: 'topic',
+            key: 'topic_咖啡',
+            value: '你这周靠咖啡续命',
+            source: 'web_app_detail',
+            weight: 0.74,
+            lastConfirmed: new Date(now - 36 * 60 * 60 * 1000),
+        });
+        diary.legacyRecords = new Map([
+            ['SYS_PENDING_FOLLOW_UP', '记得追问论文交稿结果'],
+            ['SYS_WEB_APP_LAST_CONTEXT', 'MiniApp细节：论文改到第三版了'],
+        ]);
+        store.set('review-panel-chat', diary);
+
+        const ctx = createContext({
+            chat: { id: 'review-panel-chat', type: 'private' },
+            message: { text: '/review', date: 1710000000, message_id: 1 },
+        });
+        await bot.getCommand('review')(ctx);
+
+        assert.match(ctx.__replies[0].text, /这周新记住的/);
+        assert.match(ctx.__replies[0].text, /记得追问论文交稿结果/);
+        assert.match(ctx.__replies[0].text, /建议你核对的/);
+        assert.match(ctx.__replies[0].text, /对话推断|记录面板/);
+    });
+
+    await runTest('/bond command renders relationship temperature and control buttons', async () => {
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+
+        const diary = createDiary({
+            chatId: 'bond-panel-chat',
+            nickname: '阿澄',
+        });
+        diary.emotionState.affection = 84;
+        diary.emotionState.darkness = 36;
+        diary.profile.supportMode = 'clarify';
+        diary.profile.pushPreference = 'proactive';
+        diary.profile.interests = ['抹茶拿铁'];
+        diary.legacyRecords = new Map([
+            ['SYS_PENDING_FOLLOW_UP', '你还没告诉我那杯抹茶最后有没有喝完'],
+        ]);
+        store.set('bond-panel-chat', diary);
+
+        const ctx = createContext({
+            chat: { id: 'bond-panel-chat', type: 'private' },
+            message: { text: '/bond', date: 1710000000, message_id: 1 },
+        });
+        await bot.getCommand('bond')(ctx);
+
+        assert.match(ctx.__replies[0].text, /你和我现在的距离/);
+        assert.match(ctx.__replies[0].text, /贴得很近|锁得很紧/);
+        assert.match(ctx.__replies[0].text, /抹茶|喝完/);
+        const keyboard = ctx.__replies[0].options.reply_markup.inline_keyboard;
+        assert.equal(keyboard[0][0].callback_data, 'bond_push_proactive');
+        assert.equal(keyboard[1][1].callback_data, 'bond_mode_clarify');
+    });
+
+    await runTest('bond actions update push preference and support mode from one panel', async () => {
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+
+        const diary = createDiary({
+            chatId: 'bond-action-chat',
+            nickname: '阿澄',
+        });
+        store.set('bond-action-chat', diary);
+
+        const pushCtx = createContext({
+            chat: { id: 'bond-action-chat', type: 'private' },
+        });
+        await bot.runAction('bond_push_proactive', pushCtx);
+        assert.equal(store.get('bond-action-chat').profile.pushPreference, 'proactive');
+        assert.match(pushCtx.__replies[0].text, /你和我现在的距离/);
+
+        const modeCtx = createContext({
+            chat: { id: 'bond-action-chat', type: 'private' },
+        });
+        await bot.runAction('bond_mode_clarify', modeCtx);
+        assert.equal(store.get('bond-action-chat').profile.supportMode, 'clarify');
+        assert.match(modeCtx.__replies[0].text, /帮我理一下/);
+    });
+
+    await runTest('memory review actions confirm, edit, and delete precisely by memory key', async () => {
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+        setupHandlers(bot, null, service);
+        const now = Date.now();
+
+        const diary = createDiary({
+            chatId: 'review-flow-chat',
+            nickname: '阿澄',
+        });
+        upsertLongTermMemory(diary, {
+            category: 'event',
+            key: 'event_hot_matcha',
+            value: '你更喜欢热的抹茶拿铁',
+            source: 'model-extractor',
+            weight: 0.42,
+            lastConfirmed: new Date(now - 16 * 60 * 60 * 1000),
+        });
+        upsertLongTermMemory(diary, {
+            category: 'event',
+            key: 'event_iced_matcha',
+            value: '你夏天会点冰抹茶拿铁',
+            source: 'model-extractor',
+            weight: 0.57,
+            lastConfirmed: new Date(now - 8 * 60 * 60 * 1000),
+        });
+        store.set('review-flow-chat', diary);
+
+        const startCtx = createContext({
+            chat: { id: 'review-flow-chat', type: 'private' },
+        });
+        await bot.runAction('review_start', startCtx);
+        const session = getMemoryReviewSession(store.get('review-flow-chat'));
+        assert.ok(session);
+        assert.equal(session.items.length, 2);
+        assert.match(startCtx.__replies[0].text, /你看着我记得对不对/);
+
+        const keepCtx = createContext({
+            chat: { id: 'review-flow-chat', type: 'private' },
+        });
+        await bot.runAction('review_keep_0', keepCtx);
+        const keptKey = session.items[0].key;
+        const keptMemory = store.get('review-flow-chat').longTermMemories.find((memory) => memory.key === keptKey);
+        assert.equal(keptMemory.source, 'user-confirm');
+        assert.ok(keptMemory.weight >= 0.85);
+
+        const editCtx = createContext({
+            chat: { id: 'review-flow-chat', type: 'private' },
+        });
+        await bot.runAction('review_edit_1', editCtx);
+        const pendingEdit = getPendingMemoryEdit(store.get('review-flow-chat'));
+        assert.equal(pendingEdit.key, session.items[1].key);
+        assert.ok(editCtx.__replies.some((reply) => reply.options.reply_markup?.force_reply));
+
+        const editReplyCtx = createContext({
+            chat: { id: 'review-flow-chat', type: 'private' },
+            message: { text: '你现在更常点少糖热抹茶拿铁', date: 1710000001, message_id: 2 },
+        });
+        await bot.emit('text', editReplyCtx);
+        const editedMemory = store.get('review-flow-chat').longTermMemories.find((memory) => memory.key === session.items[1].key);
+        assert.equal(editedMemory.value, '你现在更常点少糖热抹茶拿铁');
+        assert.equal(editedMemory.source, 'user-edit');
+
+        const deleteDiary = createDiary({
+            chatId: 'review-delete-chat',
+            nickname: '阿澄',
+        });
+        upsertLongTermMemory(deleteDiary, {
+            category: 'event',
+            key: 'event_alpha',
+            value: '你把A方案留到了最后',
+            source: 'model-extractor',
+            weight: 0.45,
+            lastConfirmed: new Date(now - 18 * 60 * 60 * 1000),
+        });
+        upsertLongTermMemory(deleteDiary, {
+            category: 'event',
+            key: 'event_beta',
+            value: '你把B方案单独收着',
+            source: 'model-extractor',
+            weight: 0.55,
+            lastConfirmed: new Date(now - 10 * 60 * 60 * 1000),
+        });
+        store.set('review-delete-chat', deleteDiary);
+
+        const deleteStartCtx = createContext({
+            chat: { id: 'review-delete-chat', type: 'private' },
+        });
+        await bot.runAction('review_start', deleteStartCtx);
+        const deleteSession = getMemoryReviewSession(store.get('review-delete-chat'));
+        const deleteCtx = createContext({
+            chat: { id: 'review-delete-chat', type: 'private' },
+        });
+        await bot.runAction('review_delete_0', deleteCtx);
+        const remainingKeys = new Set(store.get('review-delete-chat').longTermMemories.map((memory) => memory.key));
+        assert.equal(remainingKeys.has(deleteSession.items[0].key), false);
+        assert.equal(remainingKeys.has(deleteSession.items[1].key), true);
+    });
+
+    await runTest('/push panel exposes weekly review toggle state', async () => {
+        const { service, store } = createInMemoryDiaryService();
+        const bot = createBotDouble();
+        setupCommands(bot, null, service);
+
+        const diary = createDiary({ chatId: 'push-weekly-chat' });
+        store.set('push-weekly-chat', diary);
+
+        const pushCtx = createContext({
+            chat: { id: 'push-weekly-chat', type: 'private' },
+            message: { text: '/push', date: 1710000000, message_id: 1 },
+        });
+        await bot.getCommand('push')(pushCtx);
+        assert.match(pushCtx.__replies[0].text, /每周回顾/);
+        assert.equal(pushCtx.__replies[0].options.reply_markup.inline_keyboard[2][0].callback_data, 'review_toggle_weekly_push');
     });
 
     await runTest('/help command and unknown command fallback are available', async () => {

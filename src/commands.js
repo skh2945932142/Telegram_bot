@@ -5,6 +5,7 @@ const {
     escapeHtml,
     findLongTermMemoryMatches,
     getLegacyRecordsMap,
+    getLegacyRecord,
     getObsessionCount,
     getPreferredDisplayName,
     getSummaryFreshnessLabel,
@@ -15,8 +16,11 @@ const {
     normalizeTimeZone,
     normalizeSupportMode,
     parseBirthdayInput,
+    confirmLongTermMemoryByKey,
     removeLongTermMemory,
+    removeLongTermMemoryByKey,
     resetDiaryState,
+    setLegacyRecord,
     setBirthday,
     setPreferredDisplayName,
     setProfileNickname,
@@ -24,6 +28,26 @@ const {
 } = require('./utils');
 const { buildDiaryEntry } = require('./orchestrator');
 const { logRuntimeError } = require('./runtime-logging');
+const {
+    buildBondKeyboard,
+    buildBondText,
+    getBondStage,
+} = require('./bond');
+const {
+    buildReviewKeyboard,
+    buildReviewText,
+    buildWeeklyToggleButton,
+    buildMemoryReviewCardKeyboard,
+    buildMemoryReviewCardText,
+    clearPendingMemoryEdit,
+    createMemoryReviewSession,
+    getMemoryReviewItem,
+    getWeeklyReviewStatusText,
+    isWeeklyReviewEnabled,
+    markMemoryReviewItemHandled,
+    setPendingMemoryEdit,
+    setWeeklyReviewDisabled,
+} = require('./review');
 const {
     DEFAULT_PUSH_WINDOWS,
     buildPushPreferenceKeyboard,
@@ -95,11 +119,19 @@ const QUIET_OFF_TOKENS = new Set([
 ]);
 
 const DEFAULT_TIME_ZONE = 'Asia/Shanghai';
+const ONBOARDING_COMPLETED_KEY = 'SYS_ONBOARDING_COMPLETED';
+const ONBOARDING_STEP_KEY = 'SYS_ONBOARDING_STEP';
+const ONBOARDING_STEP_NAME = 'onboarding_name';
+const ONBOARDING_STEP_MODE = 'onboarding_mode';
+const ONBOARDING_STEP_PUSH = 'onboarding_push';
+const ONBOARDING_STEP_RECORD = 'onboarding_record';
 
 const HELP_COMMANDS = [
     '• <code>/start</code> 重新查看入口面板',
     '• <code>/help</code> 查看命令和示例',
     '• <code>/record</code> 打开记录面板（仅私聊）',
+    '• <code>/bond</code> 看看我现在怎么盯着你、又会怎么找你',
+    '• <code>/review</code> 查看这一周的回看与核对入口',
     '• <code>/memory</code> 查看长期记忆',
     '• <code>/recent</code> 查看最近记录与待跟进线索',
     '• <code>/forget 关键词</code> 删除一条记忆',
@@ -119,7 +151,9 @@ const HELP_COMMANDS = [
 const KNOWN_COMMANDS = new Set([
     'start',
     'help',
+    'bond',
     'mood',
+    'review',
     'memory',
     'recent',
     'forget',
@@ -316,10 +350,67 @@ function buildStartText(displayName) {
         '<b>你随时可以做这些：</b>',
         '1. 把现在最想说的那句话直接丢给我——不管是什么。',
         '2. 用 <code>/record</code> 把重要的事单独存进日记。',
-        '3. 用 <code>/memory</code> 看看我都替你记住了什么。',
+        '3. 用 <code>/review</code> 看我这周替你收住了什么，再决定要不要改。',
+        '4. 用 <code>/bond</code> 看我现在离你有多近，还有我会怎么找你。',
         '',
         '称呼不对就用 <code>/nickname</code>，想让我少说两句就 <code>/mode 别追问了</code>，想让我更主动就 <code>/push 多一点主动</code>。',
         '想看全部功能对着我发 <code>/help</code>。',
+    ].join('\n');
+}
+
+function buildOnboardingIntroText(displayName) {
+    return [
+        '<i>*把日记本推近一点，没有一下子把所有页都摊开*</i>',
+        `<b>${escapeHtml(displayName)}。</b>`,
+        '先别急着翻功能。我用半分钟把你带进来。',
+        '先从称呼开始。你要我沿用现在这个名字，还是换一个你更想听的？',
+    ].join('\n');
+}
+
+function buildOnboardingNamePromptText() {
+    return [
+        '<i>*把笔停在名字那一行，等你亲手改*</i>',
+        '那你自己告诉我。',
+        '直接发你想让我叫你的名字，我收到后就继续往下走。',
+    ].join('\n');
+}
+
+function buildOnboardingModeText() {
+    return [
+        '<i>*把语气压低一点，先让你选舒服的那档*</i>',
+        '<b>第二步：你想让我怎么回你。</b>',
+        '你可以只要陪着，也可以让我帮你理顺，或者少追问一点。',
+    ].join('\n');
+}
+
+function buildOnboardingPushText() {
+    return [
+        '<i>*把主动找你的时间线单独勾出来*</i>',
+        '<b>第三步：我要主动到什么程度。</b>',
+        '你可以让我安静一点、正常出现，或者更主动一点来找你。',
+    ].join('\n');
+}
+
+function buildOnboardingRecordText(hasWebApp) {
+    const lines = [
+        '<i>*把记录这件事轻轻摆到你手边，不逼你现在就用*</i>',
+        '<b>最后一步：记录面板。</b>',
+    ];
+
+    if (hasWebApp) {
+        lines.push('你以后想把一件事单独记下来，可以直接打开记录面板。现在也可以先跳过，直接开始和我说话。');
+    } else {
+        lines.push('记录面板现在还没接好链接。等它准备好以后，你照样可以用 <code>/record</code> 进去。');
+    }
+
+    return lines.join('\n');
+}
+
+function buildOnboardingCompleteText(displayName) {
+    return [
+        '<i>*把该记的都收好，再把常用入口翻给你看*</i>',
+        `<b>好了，${escapeHtml(displayName)}。</b>`,
+        '现在你不用先研究功能了。直接说第一句，或者从下面挑一个入口。',
     ].join('\n');
 }
 
@@ -341,7 +432,11 @@ function buildStartKeyboard() {
             { text: '查看记忆', callback_data: 'entry_memory' },
         ],
         [
+            { text: '本周回看', callback_data: 'entry_review' },
             { text: '最近记录', callback_data: 'entry_recent' },
+        ],
+        [
+            { text: '关系温度', callback_data: 'entry_bond' },
             { text: '回应方式', callback_data: 'entry_mode' },
         ],
         [
@@ -457,6 +552,7 @@ function buildPushText(diary) {
         `频率：<b>${escapeHtml(pushMeta.label)}</b>`,
         escapeHtml(pushMeta.summary),
         `时段：<b>${escapeHtml(windowsLabel)}</b>`,
+        `每周回顾：<b>${escapeHtml(getWeeklyReviewStatusText(diary))}</b>`,
         `免打扰：<b>${escapeHtml(formatQuietHoursLabel(diary))}</b>`,
         '',
         '直接改：<code>/push 安静一点 下午 晚上</code> 或 <code>/push 多一点主动</code>',
@@ -516,6 +612,7 @@ function buildStatusText(diary) {
     ensureDiaryState(diary);
 
     const mood = calcMood(diary, '');
+    const bondStage = getBondStage(diary);
     const windowLabelMap = {
         morning: '早上',
         afternoon: '下午',
@@ -548,6 +645,7 @@ function buildStatusText(diary) {
         '',
         `在意程度：<b>${diary.emotionState.affection}%</b>`,
         `警觉度：<b>${diary.emotionState.darkness}%</b>`,
+        `关系温度：<b>${escapeHtml(bondStage.label)}</b>`,
         `记住的事：<b>${visibleCount}</b> 条`,
         `日记新度：<b>${escapeHtml(getSummaryFreshnessLabel(diary))}</b>`,
         `独白数：<b>${obsessCount}</b> 条`,
@@ -594,6 +692,48 @@ async function sendRecentPanel(ctx, diaryService, chatId) {
     await replyHtml(ctx, buildRecentText(diary));
 }
 
+async function sendReviewPanel(ctx, diaryService, chatId, seedNickname = '') {
+    const diary = await diaryService.getOrCreateDiary(chatId, { nickname: seedNickname || DEFAULT_NICKNAME });
+    await replyHtml(ctx, buildReviewText(diary), {
+        reply_markup: {
+            inline_keyboard: buildReviewKeyboard(diary),
+        },
+    });
+}
+
+async function sendBondPanel(ctx, diaryService, chatId, seedNickname = '') {
+    const diary = await diaryService.getOrCreateDiary(chatId, { nickname: seedNickname || DEFAULT_NICKNAME });
+    await replyHtml(ctx, buildBondText(diary), {
+        reply_markup: {
+            inline_keyboard: buildBondKeyboard(diary),
+        },
+    });
+}
+
+async function sendMemoryReviewCards(ctx, diaryService, chatId, seedNickname = '') {
+    const { result } = await diaryService.updateDiary(
+        chatId,
+        { nickname: seedNickname || DEFAULT_NICKNAME },
+        'action:memory_review_start',
+        async (diary) => createMemoryReviewSession(diary)
+    );
+
+    if (!result || !Array.isArray(result.items) || result.items.length === 0) {
+        await replyHtml(ctx, '<i>*把这周新增的那几页都翻了一遍，又合上*</i>\n这周没有特别需要你亲自核对的新记忆。');
+        return;
+    }
+
+    await replyHtml(ctx, '<i>*把这周刚记下来的东西一条条拆开，等你点头或者划掉*</i>\n你看着我记得对不对。哪条偏了，你现在就能改。');
+
+    for (const [index, item] of result.items.entries()) {
+        await replyHtml(ctx, buildMemoryReviewCardText(item, index, result.items.length), {
+            reply_markup: {
+                inline_keyboard: buildMemoryReviewCardKeyboard(index),
+            },
+        });
+    }
+}
+
 async function sendModePanel(ctx, diaryService, chatId, seedNickname = '') {
     const diary = await diaryService.getOrCreateDiary(chatId, { nickname: seedNickname || DEFAULT_NICKNAME });
     await replyHtml(ctx, buildModeText(diary), {
@@ -610,6 +750,7 @@ async function sendPushPanel(ctx, diaryService, chatId, seedNickname = '') {
             inline_keyboard: [
                 buildPushPreferenceKeyboard(diary.profile?.pushPreference || ''),
                 buildPushWindowKeyboard(diary.profile?.pushWindows),
+                [buildWeeklyToggleButton(diary, 'push')],
             ],
         },
     });
@@ -666,6 +807,28 @@ module.exports = function setupCommands(bot, openai, diaryService) {
             await replyHtml(ctx, buildMoodSummary(diary));
         } catch (error) {
             logRuntimeError({ scope: 'command', operation: 'mood', chatId }, error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
+    });
+
+    bot.command('review', async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+
+        try {
+            await sendReviewPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'review', chatId }, error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
+        }
+    });
+
+    bot.command('bond', async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+
+        try {
+            await sendBondPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'bond', chatId }, error);
             await replyHtml(ctx, FALLBACK_ERROR_HTML);
         }
     });
@@ -1228,6 +1391,18 @@ module.exports = function setupCommands(bot, openai, diaryService) {
         await sendMemoryPanel(ctx, diaryService, chatId);
     });
 
+    bot.action('entry_review', async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        await ctx.answerCbQuery('把这一周压成一页翻给你。');
+        await sendReviewPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+    });
+
+    bot.action('entry_bond', async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        await ctx.answerCbQuery('把我现在盯着你的那一页翻给你。');
+        await sendBondPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+    });
+
     bot.action('entry_recent', async (ctx) => {
         const chatId = String(ctx.chat?.id || '');
         await ctx.answerCbQuery('把最近收进来的翻出来。');
@@ -1244,6 +1419,286 @@ module.exports = function setupCommands(bot, openai, diaryService) {
         const chatId = String(ctx.chat?.id || '');
         await ctx.answerCbQuery('我先算一下什么时候找你。');
         await sendPushPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+    });
+
+    bot.action('review_start', async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+
+        try {
+            await ctx.answerCbQuery('我把这周新增的那几条单独翻给你。');
+            await sendMemoryReviewCards(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'review_start', chatId }, error);
+            await ctx.answerCbQuery('刚才那页没翻稳。', { show_alert: false });
+        }
+    });
+
+    bot.action(/^review_keep_(\d+)$/, async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        const itemIndex = Number(ctx.match?.[1] || -1);
+
+        try {
+            const { result } = await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'action:review_keep',
+                async (diary) => {
+                    const current = getMemoryReviewItem(diary, itemIndex);
+                    if (!current) {
+                        return { status: 'missing' };
+                    }
+
+                    const confirmed = confirmLongTermMemoryByKey(diary, current.item.key, { minWeight: 0.85 });
+                    const reviewState = markMemoryReviewItemHandled(diary, itemIndex);
+                    return {
+                        status: confirmed ? 'confirmed' : 'missing',
+                        completed: reviewState.completed,
+                    };
+                }
+            );
+
+            if (result?.status !== 'confirmed') {
+                await ctx.answerCbQuery('这条已经不在原来的位置了。', { show_alert: false });
+                return;
+            }
+
+            await ctx.answerCbQuery('好，这条我继续留着。');
+            await replyHtml(
+                ctx,
+                result.completed
+                    ? '<i>*把最后一条也按回纸页里，指尖停了一秒*</i>\n好，这周要你亲自核对的我都对完了。'
+                    : '<i>*把这一条按回原位，还在边上补了个小勾*</i>\n好，这条我继续留着。'
+            );
+
+            if (result.completed) {
+                await sendReviewPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+            }
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'review_keep', chatId }, error);
+            await ctx.answerCbQuery('刚才没按稳。', { show_alert: false });
+        }
+    });
+
+    bot.action(/^review_delete_(\d+)$/, async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        const itemIndex = Number(ctx.match?.[1] || -1);
+
+        try {
+            const { result } = await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'action:review_delete',
+                async (diary) => {
+                    const current = getMemoryReviewItem(diary, itemIndex);
+                    if (!current) {
+                        return { status: 'missing' };
+                    }
+
+                    const removed = removeLongTermMemoryByKey(diary, current.item.key);
+                    const reviewState = markMemoryReviewItemHandled(diary, itemIndex);
+                    return {
+                        status: removed ? 'removed' : 'missing',
+                        completed: reviewState.completed,
+                        removed,
+                    };
+                }
+            );
+
+            if (result?.status !== 'removed') {
+                await ctx.answerCbQuery('这条已经不在原来的位置了。', { show_alert: false });
+                return;
+            }
+
+            await ctx.answerCbQuery('已经划掉了。');
+            await replyHtml(
+                ctx,
+                [
+                    '<i>*把那一行轻轻画掉，没有留下毛边*</i>',
+                    `<b>好，这条我删掉了。</b>`,
+                    result?.removed?.value ? `删掉的是：${escapeHtml(result.removed.value)}` : '',
+                ].filter(Boolean).join('\n')
+            );
+
+            if (result.completed) {
+                await sendReviewPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+            }
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'review_delete', chatId }, error);
+            await ctx.answerCbQuery('刚才没划干净。', { show_alert: false });
+        }
+    });
+
+    bot.action(/^review_skip_(\d+)$/, async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        const itemIndex = Number(ctx.match?.[1] || -1);
+
+        try {
+            const { result } = await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'action:review_skip',
+                async (diary) => markMemoryReviewItemHandled(diary, itemIndex)
+            );
+
+            await ctx.answerCbQuery('先放过这一条。');
+            if (result?.completed) {
+                await replyHtml(ctx, '<i>*把最后一页合上前又回头看了你一眼*</i>\n这轮核对先到这里。我先按你现在的意思留着。');
+                await sendReviewPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+            }
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'review_skip', chatId }, error);
+            await ctx.answerCbQuery('刚才那页没翻过去。', { show_alert: false });
+        }
+    });
+
+    bot.action(/^review_edit_(\d+)$/, async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        const itemIndex = Number(ctx.match?.[1] || -1);
+
+        try {
+            const { result } = await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'action:review_edit',
+                async (diary) => {
+                    const current = getMemoryReviewItem(diary, itemIndex);
+                    if (!current) {
+                        clearPendingMemoryEdit(diary);
+                        return null;
+                    }
+
+                    setPendingMemoryEdit(diary, {
+                        key: current.item.key,
+                        sessionIndex: itemIndex,
+                    });
+                    return current.item;
+                }
+            );
+
+            if (!result) {
+                await ctx.answerCbQuery('这条已经找不到了。', { show_alert: false });
+                return;
+            }
+
+            await ctx.answerCbQuery('你回我下一句，我就按那句改。');
+            await replyHtml(
+                ctx,
+                [
+                    '<i>*把那一行空出来，笔尖停在旁边等你*</i>',
+                    `把这条改成你现在要我记的版本：<b>${escapeHtml(result.displayKey)}</b>`,
+                    '你下一条直接发新内容给我，我会照着改。',
+                ].join('\n'),
+                {
+                    reply_markup: {
+                        force_reply: true,
+                        selective: true,
+                        input_field_placeholder: '直接发新的记忆内容',
+                    },
+                }
+            );
+            await replyHtml(ctx, '<i>*如果你突然改主意，我也不会硬拽着这一页不放*</i>', {
+                reply_markup: {
+                    inline_keyboard: [[{ text: '取消修改', callback_data: 'review_edit_cancel' }]],
+                },
+            });
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'review_edit', chatId }, error);
+            await ctx.answerCbQuery('刚才没把那一行留出来。', { show_alert: false });
+        }
+    });
+
+    bot.action('review_edit_cancel', async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+
+        try {
+            await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'action:review_edit_cancel',
+                async (diary) => {
+                    clearPendingMemoryEdit(diary);
+                }
+            );
+
+            await ctx.answerCbQuery('好，先不改了。');
+            await replyHtml(ctx, '<i>*把那支停着的笔轻轻扣回笔帽里*</i>\n好，先不改了。等你想好了再叫我。');
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'review_edit_cancel', chatId }, error);
+            await ctx.answerCbQuery('刚才没收住。', { show_alert: false });
+        }
+    });
+
+    bot.action(/^review_toggle_weekly(?:_(push))?$/, async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        const fromPushPanel = String(ctx.match?.[1] || '') === 'push';
+
+        try {
+            const { result } = await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'action:review_toggle_weekly',
+                async (diary) => {
+                    const enabled = isWeeklyReviewEnabled(diary);
+                    return setWeeklyReviewDisabled(diary, enabled);
+                }
+            );
+
+            await ctx.answerCbQuery(result ? '每周回顾已开启。' : '每周回顾已关闭。');
+            if (fromPushPanel) {
+                await sendPushPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+            } else {
+                await sendReviewPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+            }
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'review_toggle_weekly', chatId }, error);
+            await ctx.answerCbQuery('刚才那一下没切过去。', { show_alert: false });
+        }
+    });
+
+    bot.action(/^bond_push_(quiet|proactive)$/, async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        const preference = String(ctx.match?.[1] || '');
+
+        try {
+            await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'action:bond_push',
+                async (diary) => {
+                    diary.profile.pushPreference = preference;
+                    diary.markModified('profile');
+                }
+            );
+
+            await ctx.answerCbQuery(preference === 'proactive' ? '好，我会更常回来看你。' : '好，我先收敛一点。');
+            await sendBondPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'bond_push_action', chatId }, error);
+            await ctx.answerCbQuery('刚才没调稳。', { show_alert: false });
+        }
+    });
+
+    bot.action(/^bond_mode_(companion|clarify)$/, async (ctx) => {
+        const chatId = String(ctx.chat?.id || '');
+        const mode = String(ctx.match?.[1] || '');
+
+        try {
+            await diaryService.updateDiary(
+                chatId,
+                { nickname: String(ctx.from?.first_name || '').trim() || DEFAULT_NICKNAME },
+                'action:bond_mode',
+                async (diary) => {
+                    diary.profile.supportMode = mode;
+                    diary.markModified('profile');
+                }
+            );
+
+            await ctx.answerCbQuery(mode === 'clarify' ? '好，我替你理顺。' : '好，我先只陪着你。');
+            await sendBondPanel(ctx, diaryService, chatId, String(ctx.from?.first_name || '').trim());
+        } catch (error) {
+            logRuntimeError({ scope: 'command', operation: 'bond_mode_action', chatId }, error);
+            await ctx.answerCbQuery('刚才没切过去。', { show_alert: false });
+        }
     });
 
     bot.action(/^support_mode_(companion|clarify|quiet)$/, async (ctx) => {

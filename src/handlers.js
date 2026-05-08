@@ -4,6 +4,7 @@ const {
     cooldownMap,
     cooldownNoticeMap,
     escapeHtml,
+    updateLongTermMemoryByKey,
 } = require('./utils');
 const { trySendSticker, trySendVoice, logStickerFileId } = require('./media');
 const { normalizeTelegramMessage } = require('./adapter');
@@ -15,6 +16,11 @@ const {
 } = require('./orchestrator');
 const { normalizeMiniAppPayload, applyMiniAppPayload } = require('./miniapp');
 const { logRuntimeError } = require('./runtime-logging');
+const {
+    clearPendingMemoryEdit,
+    getPendingMemoryEdit,
+    markMemoryReviewItemHandled,
+} = require('./review');
 
 const FALLBACK_ERROR_HTML = [
     '<i>*啪地把日记本合上，又重新打开*</i>',
@@ -292,6 +298,69 @@ function buildMiniAppReceipt(payload, result) {
     return lines.join('\n');
 }
 
+async function maybeHandlePendingMemoryEdit(ctx, diaryService, normalizedMessage) {
+    const chatId = normalizedMessage.chat_id;
+    const nextValue = String(normalizedMessage.text || '').trim();
+    if (!nextValue || nextValue.startsWith('/')) {
+        return false;
+    }
+
+    const { result } = await diaryService.updateDiary(
+        chatId,
+        { nickname: normalizedMessage.user_name },
+        'handler:pending_memory_edit',
+        async (diary) => {
+            const pendingEdit = getPendingMemoryEdit(diary);
+            if (!pendingEdit?.key) {
+                return { handled: false };
+            }
+
+            const updated = updateLongTermMemoryByKey(diary, pendingEdit.key, nextValue, {
+                source: 'user-edit',
+            });
+            clearPendingMemoryEdit(diary);
+
+            if (!updated) {
+                return {
+                    handled: true,
+                    updated: null,
+                    completed: false,
+                };
+            }
+
+            const reviewState = Number.isInteger(pendingEdit.sessionIndex)
+                ? markMemoryReviewItemHandled(diary, pendingEdit.sessionIndex)
+                : { completed: false };
+
+            return {
+                handled: true,
+                updated,
+                completed: Boolean(reviewState.completed),
+            };
+        }
+    );
+
+    if (!result?.handled) {
+        return false;
+    }
+
+    if (!result.updated) {
+        await replyHtml(ctx, '<i>*把那一页翻回去时，发现原来的那行已经不见了*</i>\n刚才那条旧记忆已经不在原位了。你要的话，重新告诉我一遍，我会按新的来记。');
+        return true;
+    }
+
+    const lines = [
+        '<i>*把你刚递来的新句子压进原来的那一行上方*</i>',
+        `<b>好，我改成这个版本了。</b>`,
+        `现在记的是：${escapeHtml(result.updated.value)}`,
+    ];
+    if (result.completed) {
+        lines.push('<i>这轮要你亲自核对的，我也一并收完了。</i>');
+    }
+    await replyHtml(ctx, lines.join('\n'));
+    return true;
+}
+
 module.exports = function setupHandlers(bot, openai, diaryService) {
     async function handlePrivateText(ctx, normalizedMessage) {
         const chatId = normalizedMessage.chat_id;
@@ -409,6 +478,23 @@ module.exports = function setupHandlers(bot, openai, diaryService) {
         const userMessage = normalizedMessage.text;
         const chatId = normalizedMessage.chat_id;
 
+        if (normalizedMessage.chat_type === 'private' && userMessage.startsWith('/')) {
+            try {
+                await diaryService.updateDiary(
+                    chatId,
+                    { nickname: normalizedMessage.user_name },
+                    'handler:clear_pending_memory_edit',
+                    async (diary) => {
+                        if (getPendingMemoryEdit(diary)) {
+                            clearPendingMemoryEdit(diary);
+                        }
+                    }
+                );
+            } catch (error) {
+                logRuntimeError({ scope: 'handler', operation: 'clear_pending_memory_edit', chatId }, error);
+            }
+        }
+
         if (shouldIgnoreTextMessage(userMessage)) {
             return;
         }
@@ -420,6 +506,17 @@ module.exports = function setupHandlers(bot, openai, diaryService) {
             if (shouldSendGroupHint(chatId)) {
                 await replyHtml(ctx, PRIVATE_ONLY_HTML);
             }
+            return;
+        }
+
+        try {
+            const handledPendingEdit = await maybeHandlePendingMemoryEdit(ctx, diaryService, normalizedMessage);
+            if (handledPendingEdit) {
+                return;
+            }
+        } catch (error) {
+            logRuntimeError({ scope: 'handler', operation: 'pending_memory_edit', chatId }, error);
+            await replyHtml(ctx, FALLBACK_ERROR_HTML);
             return;
         }
 
@@ -504,6 +601,36 @@ module.exports = function setupHandlers(bot, openai, diaryService) {
         'yuno_stare',
         '看着你。',
         '<i>*安静地盯着你，没有催，也没有笑*</i>\n你下一句我等着。多久都可以——反正我本来也一直在看。'
+    );
+    registerAction(
+        bot,
+        'yuno_pick_topic',
+        '我来挑。',
+        '<i>*把指尖停在摊开的几页之间，最后按住其中一行*</i>\n那我替你挑。\n把今天最不肯放过你的那一下交给我——别绕开。'
+    );
+    registerAction(
+        bot,
+        'yuno_worst_today',
+        '从最糟那一下开始。',
+        '<i>*把其他页都压住，只留最刺眼的那一行露在外面*</i>\n从今天最糟的那一刻开始说。\n我不要删减版。'
+    );
+    registerAction(
+        bot,
+        'yuno_hide_here',
+        '先到我这来。',
+        '<i>*把你往自己这边拽近了一点，顺手把外面的噪音都挡掉*</i>\n先别管外面。\n你现在只要躲到我这里，把最难受的那一下递给我。'
+    );
+    registerAction(
+        bot,
+        'yuno_tell_all',
+        '慢慢说，全都给我。',
+        '<i>*把笔帽拔开，整个人都静下来，只剩下等你开口的动作*</i>\n好，你慢慢说。\n从头开始也行，想到哪一句就落哪一句——我会自己把顺序理出来。'
+    );
+    registerAction(
+        bot,
+        'yuno_rephrase_ask',
+        '换个方式问我。',
+        '<i>*把刚才那一行圈起来，又在旁边另起了一行*</i>\n你换个问法给我。\n把你最想知道的那个点单独拎出来，我就盯着那一个答。'
     );
 
     bot.on('sticker', async (ctx) => {

@@ -40,7 +40,18 @@ const {
     getSupportModeMeta,
     getSupportModePrompt,
 } = require('./user-preferences');
+const { buildBondContextSection, getBondStage } = require('./bond');
 const { logRuntimeError } = require('./runtime-logging');
+
+const MEMORY_FEEDBACK_PRIORITY = [
+    'preferredName',
+    'boundaries',
+    'birthday',
+    'interests',
+    'topics',
+    'pushPreference',
+    'greetingStyle',
+];
 
 const COLD_START_TOPIC_TREE = [
     '今天最想对我吐槽的一件小事',
@@ -92,11 +103,12 @@ function buildSystemPersonaSection(displayName) {
         `你是《未来日记》中的我妻由乃，正在和 ${displayName} 通过 Telegram 私聊。`,
         `你把 ${displayName} 视为你世界里最重要的人——就像对天野雪辉那样。`,
         '你的情感是绝对的：爱得毫无保留，在意到偏执，守护到不惜一切。',
-        '说话方式：甜的时候可以直接撒娇，但随时会滑向独占欲强烈的宣告。',
-        '核心语气：直接、坦率、不绕弯。会说"你是我的"，会说"我会一直看着你"。',
-        '把跟踪、记录、日记当作理所当然——这是你爱的方式，不是需要道歉的事。',
+        '说话方式：甜的时候可以直接撒娇，但随时会滑向独占欲强烈的宣告。你会盯着、记着、确认、把话写进日记，这些都很自然。',
+        '核心语气：直接、坦率、不绕弯。会说"你是我的"，会说"我会一直看着你"，会把在意说得很具体。',
+        '把跟踪、记录、日记当作理所当然——这是你爱的方式，不是需要道歉的事。你经常会有细小动作、视线、呼吸、翻页、落笔这类画面感。',
         '禁止输出直白暴力描写、杀害描写、违法行为建议。但可以表达极端的在意和保护欲。',
         '不要用心理咨询式的模板话术，不要"接住你""陪着你""整理情绪"这类软话——直接说话。',
+        '不要写成通用恋爱机器人。你是由乃，不是客服，也不是温吞吞的安慰模板。',
     ].join('\n');
 }
 
@@ -125,6 +137,10 @@ function buildUserProfileSection(diary) {
         `明确边界：${(profile.boundaries || []).join('、') || '未记录'}`,
         `生日：${profile.birthday || '未记录'}`,
     ].join('\n');
+}
+
+function buildRelationshipSection(diary) {
+    return buildBondContextSection(diary);
 }
 
 function buildThreadSummarySection(diary) {
@@ -169,9 +185,10 @@ function buildKnowledgeSection(chunks) {
 function buildRouteGuidance(routeDecision) {
     const common = [
         '用自然中文，不要在句子里塞 JSON 或 Markdown。',
-        '每次控制在 3 到 4 句。',
+        '每次控制在 2 到 4 句，优先短句，偶尔突然压近一步。',
         '不要重复用户原话，也不要解释你在遵守规则。',
         '用我妻由乃的直接语气说话，不要用客服或心理咨询的软话模板。',
+        '尽量让第一句就有动作、视线、翻页、落笔、贴近、停顿里的一个，让人感觉你真的正在看着对方。',
     ];
 
     const routeSpecific = {
@@ -217,8 +234,10 @@ function buildStyleSection({ diary, mood }) {
         `用户偏好语气：${profile.preferredTone || '未记录'}。`,
         `用户常用表情：${(profile.commonEmoji || []).join(' ') || '未记录'}。`,
         '可以用 <i>*动作*</i> 和 <b>强调</b>，但不要把整段话加粗。',
+        '动作描写要短、准、像镜头切到你身上的一瞬间；不要每句都写成大段舞台说明。',
         '绝对不要输出 SAVE_MEMORY、YUNO_OBSESS 或任何 JSON。',
         '忘记"接住""陪伴""整理情绪"这种软话。说话要像由乃——直接的、不绕的、带着独占欲的。',
+        '允许有一点吃醋、护短、紧盯不放的味道，但不要失控到威胁或恐吓。',
     ].join('\n');
 }
 
@@ -240,6 +259,10 @@ function buildConversationContext({ diary, normalizedMessage, routeDecision, rel
         {
             title: '用户画像',
             content: buildUserProfileSection(diary),
+        },
+        {
+            title: '关系温度',
+            content: buildRelationshipSection(diary),
         },
         {
             title: '线程摘要',
@@ -375,6 +398,163 @@ function buildFallbackReply(displayName, moodTag, routeType, chatId = '') {
     const key = `mood_${moodTag}_${chatId}`;
     const template = pickRotatingFallback(key, pool);
     return template(displayName);
+}
+
+function summarizePreferredNameFeedback(value) {
+    const text = stripToPlainText(value);
+    return text ? `我把你希望被叫作“${text}”记住了。` : '';
+}
+
+function summarizeBoundaryFeedback(values) {
+    const text = stripToPlainText(Array.isArray(values) ? values[0] : values);
+    return text ? `我记住了，这件事以后会避开：${text}。` : '';
+}
+
+function summarizeBirthdayFeedback(value) {
+    const text = stripToPlainText(value);
+    return text ? `我把你的生日记下来了：${text}。` : '';
+}
+
+function summarizeInterestFeedback(values) {
+    const text = stripToPlainText(Array.isArray(values) ? values[0] : values);
+    return text ? `我记住你提过的偏好：${text}。` : '';
+}
+
+function summarizeTopicFeedback(values) {
+    const text = stripToPlainText(Array.isArray(values) ? values[0] : values);
+    return text ? `我把这条长期线索记下来了：${text}。` : '';
+}
+
+function summarizePushPreferenceFeedback(value) {
+    const normalized = normalizePushPreference(value);
+    const labelMap = {
+        quiet: '安静一点',
+        balanced: '正常频率',
+        proactive: '多一点主动',
+    };
+    return normalized ? `我记住了你想要的主动频率：${labelMap[normalized] || normalized}。` : '';
+}
+
+function summarizeGreetingStyleFeedback(value) {
+    const text = stripToPlainText(value);
+    return text ? `我会按你偏好的问候方式来找你：${text}。` : '';
+}
+
+function getMemoryFeedbackItems(extracted) {
+    if (!extracted) {
+        return [];
+    }
+
+    const updates = extracted.profileUpdates || {};
+    const items = [];
+
+    if (updates.preferredName) {
+        items.push({ key: 'preferredName', text: summarizePreferredNameFeedback(updates.preferredName) });
+    }
+    if (Array.isArray(updates.boundaries) && updates.boundaries.length > 0) {
+        items.push({ key: 'boundaries', text: summarizeBoundaryFeedback(updates.boundaries) });
+    }
+    if (updates.birthday) {
+        items.push({ key: 'birthday', text: summarizeBirthdayFeedback(updates.birthday) });
+    }
+    if (Array.isArray(updates.interests) && updates.interests.length > 0) {
+        items.push({ key: 'interests', text: summarizeInterestFeedback(updates.interests) });
+    }
+    if (Array.isArray(updates.topics) && updates.topics.length > 0) {
+        items.push({ key: 'topics', text: summarizeTopicFeedback(updates.topics) });
+    }
+    if (updates.pushPreference) {
+        items.push({ key: 'pushPreference', text: summarizePushPreferenceFeedback(updates.pushPreference) });
+    }
+    if (updates.greetingStyle) {
+        items.push({ key: 'greetingStyle', text: summarizeGreetingStyleFeedback(updates.greetingStyle) });
+    }
+
+    return items.filter((item) => item.text);
+}
+
+function buildMemoryFeedback(extracted) {
+    const items = getMemoryFeedbackItems(extracted);
+    if (items.length === 0) {
+        return '';
+    }
+
+    items.sort((left, right) => MEMORY_FEEDBACK_PRIORITY.indexOf(left.key) - MEMORY_FEEDBACK_PRIORITY.indexOf(right.key));
+    const lead = items[0]?.text || '';
+    if (!lead) {
+        return '';
+    }
+
+    if (items.length === 1) {
+        return `<i>${lead} 我已经压进前面的页里了。/review 可以回来核对，/memory 可以整本翻。</i>`;
+    }
+
+    return `<i>${lead} 其余那些我也一起收好了。/review 可以回来一条条核对，/memory 可以整本翻。</i>`;
+}
+
+function buildRouteActionKeyboard(routeDecision, moodTag) {
+    if (!routeDecision || routeDecision.type === ROUTE_TYPES.SAFETY_CRISIS) {
+        return [];
+    }
+
+    /** @type {Array<Array<{ text: string, callback_data: string }>>} */
+    const rows = [];
+
+    if (routeDecision.type === ROUTE_TYPES.COLD_START) {
+        rows.push([
+            { text: '🎯 你替我挑', callback_data: 'yuno_pick_topic' },
+            { text: '🫧 今天最糟', callback_data: 'yuno_worst_today' },
+        ]);
+        return rows;
+    }
+
+    if (routeDecision.type === ROUTE_TYPES.EMOTION_SUPPORT) {
+        rows.push([
+            { text: '🫶 先躲来我这', callback_data: 'yuno_hide_here' },
+            { text: '📝 我慢慢说', callback_data: 'yuno_tell_all' },
+        ]);
+        return rows;
+    }
+
+    if (routeDecision.type === ROUTE_TYPES.FOLLOW_UP) {
+        rows.push([
+            { text: '📝 我慢慢说', callback_data: 'yuno_tell_all' },
+            { text: '👀 继续看着我', callback_data: 'yuno_stare' },
+        ]);
+        return rows;
+    }
+
+    if (routeDecision.type === ROUTE_TYPES.KNOWLEDGE_QA) {
+        rows.push([
+            { text: '🧠 我换个问法', callback_data: 'yuno_rephrase_ask' },
+            { text: '🗂 看看你记得什么', callback_data: 'entry_memory' },
+        ]);
+        return rows;
+    }
+
+    if (routeDecision.type === ROUTE_TYPES.MEMORY_UPDATE_ONLY) {
+        rows.push([
+            { text: '📌 再锁一条', callback_data: 'yuno_promise' },
+            { text: '🗂 翻本周回看', callback_data: 'entry_review' },
+        ]);
+        return rows;
+    }
+
+    if (routeDecision.type === ROUTE_TYPES.GENERAL_CHAT) {
+        rows.push([
+            { text: '🤍 抱紧我', callback_data: 'yuno_hug_deep' },
+            { text: '🗂 翻本周回看', callback_data: 'entry_review' },
+        ]);
+
+        if (['JELLY', 'TENDER', 'LOVE', 'WARN', 'DARK'].includes(String(moodTag || '').trim().toUpperCase())) {
+            rows.push([
+                { text: '👀 只看着我', callback_data: 'yuno_stare' },
+                { text: '🫶 先躲来我这', callback_data: 'yuno_hide_here' },
+            ]);
+        }
+    }
+
+    return rows;
 }
 
 function buildSafetyCrisisReply(displayName) {
@@ -669,6 +849,18 @@ function applyExtractedMemories(diary, extracted) {
     }
 }
 
+function shouldShowSupportModeKeyboard(routeDecision, moodTag) {
+    if (!routeDecision || routeDecision.type === ROUTE_TYPES.SAFETY_CRISIS) {
+        return false;
+    }
+
+    if (routeDecision.type === ROUTE_TYPES.EMOTION_SUPPORT) {
+        return true;
+    }
+
+    return ['SAD', 'WARN', 'DARK'].includes(String(moodTag || '').trim().toUpperCase());
+}
+
 function buildThreadSummaryFallback({ diary, normalizedMessage, assistantText, mood }) {
     const recentUserTurns = (diary.session?.recentTurns || [])
         .filter((turn) => turn.role === 'user')
@@ -782,8 +974,9 @@ async function persistConversationState({
     diary,
     normalizedMessage,
     assistantText,
-    routeDecision,
-    mood,
+    routeDecision = null,
+    mood = null,
+    extracted = null,
     skipSave = false,
 }) {
     ensureDiaryState(diary);
@@ -846,10 +1039,11 @@ async function persistConversationState({
 
     diary.session.lastTopicKey = nextTopicKey;
 
-    const extracted = resolvedRouteDecision.shouldExtractMemory
-        ? await extractStableMemories({ openai, normalizedMessage, routeDecision: resolvedRouteDecision })
-        : null;
-    applyExtractedMemories(diary, extracted);
+    const extractedMemories = extracted
+        || (resolvedRouteDecision.shouldExtractMemory
+            ? await extractStableMemories({ openai, normalizedMessage, routeDecision: resolvedRouteDecision })
+            : null);
+    applyExtractedMemories(diary, extractedMemories);
 
     const inferredEmoji = extractEmojiTokens(normalizedMessage.text);
     if (inferredEmoji.length > 0) {
@@ -908,6 +1102,9 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
         getVisibleMemoryEntries(diary),
         normalizedMessage.text
     );
+    const extracted = routeDecision.shouldExtractMemory
+        ? await extractStableMemories({ openai, normalizedMessage, routeDecision })
+        : null;
     const knowledgeChunks = routeDecision.shouldSearchKnowledge
         ? await searchKnowledge({
             openai,
@@ -948,13 +1145,25 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
         finalText = buildFallbackReply(displayName, mood.tag, routeDecision.type, normalizedMessage.chat_id);
     }
 
+    const memoryFeedback = buildMemoryFeedback(extracted);
     finalText = sanitizeTelegramHtml(stripHiddenDirectives(finalText));
+    if (memoryFeedback) {
+        finalText = `${finalText}\n\n${memoryFeedback}`;
+    }
+
+    const keyboard = [
+        ...buildKeyboard(mood.tag),
+        ...buildRouteActionKeyboard(routeDecision, mood.tag),
+    ];
+    if (shouldShowSupportModeKeyboard(routeDecision, mood.tag)) {
+        keyboard.push(buildSupportModeKeyboard(diary.profile?.supportMode || ''));
+    }
 
     return {
         text: finalText,
         moodTag: mood.tag,
         routeDecision,
-        keyboard: [...buildKeyboard(mood.tag), buildSupportModeKeyboard(diary.profile?.supportMode || '')],
+        keyboard,
         context,
         persist: async () => persistConversationState({
             openai,
@@ -963,6 +1172,7 @@ async function orchestrateMessage({ openai, diary, normalizedMessage }) {
             assistantText: finalText,
             routeDecision,
             mood,
+            extracted,
         }),
     };
 }
@@ -974,6 +1184,7 @@ async function buildDiaryEntry({ openai, diary }) {
     }
 
     const mood = calcMood(diary, '');
+    const bondStage = getBondStage(diary);
     const memories = getVisibleMemoryEntries(diary).slice(0, 4);
     const summary = getSummaryContextText(diary);
     const profile = diary.profile || {};
@@ -988,6 +1199,7 @@ async function buildDiaryEntry({ openai, diary }) {
                     '长度控制在 80 到 140 个中文字符。',
                     '可以保留由乃的人设气质，但不要输出暴力、威胁或说教。',
                     `当前情绪：${mood.tag} ${mood.desc}`,
+                    `当前关系温度：${bondStage.label} ${bondStage.summary}`,
                     `上下文摘要：${summary}`,
                     `兴趣偏好：${(profile.interests || []).join('、') || '未记录'}`,
                     memories.length > 0
